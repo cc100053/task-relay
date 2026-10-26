@@ -80,6 +80,7 @@ into Codex (no hooks, no AGENTS.md edits, no proxy), so Codex upgrades can't bre
   comes from (1) the job the watchdog started (`thread.started` event of `codex exec --json`),
   (2) a single `resume <UUID>` in the stopped processes' command lines, or (3) `thread_id` in
   config. Zero or several candidates → `needs_user`. Never `--last`.
+* `queue`: `codex queue --thread <UUID> --message <prompt>` (desktop app; see §3).
 * `command`: user-defined argv with `{thread_id}`, `{cwd}`, `{prompt}`, `{codex}` placeholders
   (e.g. relaunch the desktop app or a script).
 * `none`: stop + wait only.
@@ -115,3 +116,35 @@ Rotating log file in the per-user data dir; `cqw status` (live quota + state), `
   the force step after the timeout is normal there.
 * **macOS:** LaunchAgent with captured `PATH`; Desktop app detected under `Codex.app`.
 * **Linux:** `systemd --user` unit; for headless servers enable lingering if needed.
+
+## 3. Desktop app & several sessions (`discover_threads`)
+
+Problem: the Codex desktop app (and an orchestrator that fans work out to several threads) keeps
+its threads inside one app-server process. No command line carries a thread UUID, the old
+"exactly one UUID or `needs_user`" rule resumes nothing, and killing the app would close the UI.
+
+Verified against Codex CLI 0.164.0 (`codex app-server generate-json-schema` + live runs):
+
+* `thread/list` (`sortKey: "updated_at"`, `sourceKinds`, `archived: false`) lists threads across
+  every client of the same `CODEX_HOME`, including ones the app created, without loading them.
+* `thread/turns/list` (`limit: 1`, `sortDirection: "desc"`) returns the latest turn with
+  `status` (`completed | interrupted | failed | inProgress`) and `error.codexErrorInfo`, whose
+  enum includes **`usageLimitExceeded`**, distinct from `rateLimitExceeded` (429) and transport errors.
+* A turn whose process is killed reads back as `interrupted` with `error: null`: killing destroys
+  the limit signal. So this mode never kills; Codex stops itself at the hard limit.
+* `codex queue --thread <UUID> --message <text>` stores the message in `queue_1.sqlite` and exits 0
+  ("Queued message ... for thread ..."). It does **not** start a turn by itself; a client that
+  holds the thread (the app) sends it. Loading the thread with `thread/resume` from another client
+  does not drain the queue either. Hence the post-check below.
+
+Decision rules:
+1. Candidate = latest turn has `codexErrorInfo == "usageLimitExceeded"` and ended within
+   `thread_lookback_hours`. Anything else is left alone (finished, killed, user already continued).
+2. A candidate's turn id is remembered after resuming; the same limited turn is never resumed twice.
+3. Sub-agent threads are skipped by default (the parent re-drives them); `resume_subagents` opts in.
+4. Threads the watchdog stopped itself (CLI processes, `cqw run` job) are added by exact UUID.
+5. Caps: `max_threads_per_resume` per reset, `max_restarts_per_day` per thread; leftovers → `needs_user`.
+6. `queue` mode: after `queue_start_timeout_seconds`, each thread must show a turn started after the
+   queue time; otherwise `needs_user` naming the threads. Unreadable → check again later.
+7. Thread listing fails → stay in the wait phase (no resume) and retry.
+

@@ -62,6 +62,37 @@ It starts `codex exec --json …`, captures the thread UUID from the `thread.sta
 guards it: stop near the limit → wait for reset → `codex exec resume <UUID> "<resume prompt>"` →
 repeat until the job exits successfully.
 
+**C. Codex desktop app, or several sessions at once (`discover_threads = true`)**
+For the Mac/Windows Codex app, and for an orchestrator that hands work to several threads. No command
+line carries a thread UUID there, so instead the watchdog asks `codex app-server` which threads'
+**latest turn failed with `usageLimitExceeded`**, the exact signal Codex records when it hits the limit
+itself, and resumes **each** of them by its exact UUID:
+
+```toml
+[watchdog]
+discover_threads = true
+restart_mode = "queue"        # `codex queue --thread <UUID>`: the app sends it in the same thread
+stop_cli = false              # don't kill anything: let Codex stop itself at the limit
+```
+
+Flow: quota near the threshold → wait phase (nothing is killed) → Codex stops at the hard limit →
+after the official reset + confirmations → `codex queue` the resume prompt into every limited thread
+(newest first, up to `max_threads_per_resume`) → ~15 min later, check that each one really started
+a new turn, otherwise park in `needs_user` with the thread ids.
+
+Check it before arming, on the machine that runs the app:
+
+```bash
+cqw threads           # threads whose last turn stopped on the usage limit (what would be resumed)
+cqw threads --all     # every recent thread with its last turn status
+```
+
+Rules: a limited turn is resumed **once** (its turn id is remembered); a thread whose newest turn is
+anything else (finished, interrupted with no error, or you already continued it) is left alone;
+sub-agent threads are skipped unless `resume_subagents = true` (their parent thread re-drives them);
+`max_restarts_per_day` counts per thread. With `restart_mode = "exec-resume"` the threads are instead
+resumed headless (`codex exec resume`, output in `jobs/*.log`), each in its own recorded cwd.
+
 ### Run in the background / at logon
 
 ```powershell
@@ -78,6 +109,7 @@ The autostarted watchdog runs `cqw watch --quiet` and respects `armed` in your c
 |---|---|
 | `cqw doctor` | Environment check, live quota read, list of processes that would be stopped, armed state |
 | `cqw status` | Live quota per window, verdict, next restart check, persisted watchdog state |
+| `cqw threads [--all] [--hours H]` | Threads whose last turn stopped on the usage limit (read-only) |
 | `cqw watch [--arm] [--dry-run] [--quiet] [--once]` | The watchdog loop |
 | `cqw run [--arm] [--cd DIR] -- PROMPT` | Start a guarded headless `codex exec` job |
 | `cqw clear` | Leave `needs_user` after you have checked things, back to monitoring |
@@ -112,13 +144,20 @@ stop_desktop = false             # desktop app — true closes your UI too
 extra_process_patterns = []      # extra regexes on the command line
 terminate_timeout_seconds = 20   # polite stop, then force-kill
 
-restart_mode = "exec-resume"     # exec-resume | command | none
+restart_mode = "exec-resume"     # exec-resume | queue | command | none
 exec_extra_args = []             # e.g. ["--sandbox", "workspace-write"] (check `codex exec --help`)
 resume_prompt = "The ChatGPT usage window has reset. Continue the previous task ..."
 thread_id = ""                   # fallback UUID to resume
 restart_cwd = ""
 restart_command = []             # for restart_mode = "command"; placeholders {thread_id} {cwd} {prompt} {codex}
-max_restarts_per_day = 6
+max_restarts_per_day = 6         # per thread when discover_threads = true
+
+discover_threads = false         # resume every thread whose last turn hit the usage limit
+thread_lookback_hours = 12.0     # ...if that turn ended within this many hours
+resume_subagents = false
+max_threads_per_resume = 8
+resume_stagger_seconds = 5
+queue_start_timeout_seconds = 900  # restart_mode = "queue": needs_user if no turn started by then
 
 codex_path = ""                  # auto: CODEX_PATH env, PATH, desktop bundle, %APPDATA%\npm\codex.cmd
 app_server_args = ["app-server"] # older CLIs: ["app-server", "--stdio"]
@@ -141,8 +180,8 @@ weekly reset. Sleeps are chunked (≤ 5 min) so laptop sleep and clock changes a
   (older Codex without that field: every window above threshold, no stale `resetsAt`);
 * `confirm_reads` consecutive healthy reads;
 * same `accountId` as at stop time;
-* an exact thread UUID is known (exec-resume mode);
-* fewer than `max_restarts_per_day` restarts in the last 24 h.
+* an exact thread UUID is known (exec-resume / queue mode);
+* fewer than `max_restarts_per_day` restarts in the last 24 h (per thread with `discover_threads`).
 
 Anything else → keep waiting, or park in `needs_user` (logged). A parked watchdog **still stops Codex**
 on low quota but never restarts anything until you run `cqw clear`.
@@ -157,7 +196,12 @@ on low quota but never restarts anything until you run `cqw clear`.
   `jobs/*.log`, not as a new TUI window. Open the thread in Codex afterwards to see it.
 * **Plain TUI sessions have no UUID on their command line**, so in guard mode the watchdog can stop and wait but
   can't resume them unless you set `thread_id`. Use `cqw run`, or start work with `codex resume <UUID>`.
-* **Desktop app:** stopping it is opt-in (`stop_desktop`), restarting it needs `restart_mode = "command"`.
+* **Desktop app:** use `discover_threads` + `restart_mode = "queue"` (mode C). `codex queue` only stores
+  the message; the app sends it, which is why the watchdog checks afterwards that a turn started.
+  Whether the app sends a queued message to a thread that is idle in the background depends on the app
+  version; if `needs_user` reports "queued message not started", open that thread in the app (the
+  message is waiting there) or switch to `restart_mode = "exec-resume"`. Stopping the app itself is
+  still opt-in (`stop_desktop`), and a killed turn records no limit error, so mode C never kills.
   Process detection is by name/path heuristics — always check `cqw doctor` before arming.
 * **Windows consoles ignore polite stops**, so after `terminate_timeout_seconds` the CLI is force-killed.
 * **`ordinaryUsageAllowed`** and the app-server protocol are OpenAI's and may change; the watchdog treats any

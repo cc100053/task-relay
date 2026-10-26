@@ -76,6 +76,8 @@ class Config:
     # --- Restart -------------------------------------------------------------
     # none        : stop + wait only, never start anything.
     # exec-resume : `codex exec resume <thread UUID> <prompt>` (exact UUID only, never --last).
+    # queue       : `codex queue --thread <UUID> --message <prompt>`; the Codex desktop app
+    #               sends the queued message in the same thread, visible in its UI.
     # command     : run `restart_command` (a list of args, placeholders allowed).
     restart_mode: str = "exec-resume"
     resume_prompt: str = (
@@ -89,8 +91,22 @@ class Config:
     restart_cwd: str = ""
     # Thread to resume when none was captured automatically.
     thread_id: str = ""
-    # Safety valve against restart loops.
+    # Safety valve against restart loops (per thread when discover_threads is on).
     max_restarts_per_day: int = 6
+
+    # --- Thread discovery (desktop app, several sessions at once) -------------
+    # Find every thread whose latest turn stopped on the usage limit and resume each one.
+    # Also enters the wait phase when no Codex process was stopped (Codex stops itself).
+    discover_threads: bool = False
+    # Only threads whose limited turn ended within this many hours.
+    thread_lookback_hours: float = 12.0
+    # Sub-agent threads are normally driven by their parent; resume them separately only if true.
+    resume_subagents: bool = False
+    # Resume at most this many threads per reset, and pause between them.
+    max_threads_per_resume: int = 8
+    resume_stagger_seconds: int = 5
+    # restart_mode = "queue": warn (needs_user) when no turn has started this long after queueing.
+    queue_start_timeout_seconds: int = 900
 
     # --- Logging -------------------------------------------------------------
     log_level: str = "INFO"
@@ -108,7 +124,7 @@ class ConfigError(ValueError):
     pass
 
 
-RESTART_MODES = ("none", "exec-resume", "command")
+RESTART_MODES = ("none", "exec-resume", "queue", "command")
 
 
 def load_config(path: Path | None = None, overrides: dict | None = None) -> Config:
@@ -162,6 +178,10 @@ def validate(cfg: Config) -> None:
         raise ConfigError("confirm_reads must be at least 1")
     if not cfg.app_server_args:
         raise ConfigError("app_server_args must not be empty")
+    if cfg.thread_lookback_hours <= 0:
+        raise ConfigError("thread_lookback_hours must be positive")
+    if cfg.max_threads_per_resume < 1:
+        raise ConfigError("max_threads_per_resume must be at least 1")
 
 
 SAMPLE_CONFIG = """\
@@ -182,13 +202,22 @@ stop_cli = true              # codex CLI / TUI / exec processes
 stop_desktop = false         # the desktop app (closes your UI if true)
 terminate_timeout_seconds = 20
 
-# none | exec-resume | command
+# none | exec-resume | queue | command
 restart_mode = "exec-resume"
 # exec_extra_args = ["--sandbox", "workspace-write"]
 # thread_id = "00000000-0000-0000-0000-000000000000"
 # restart_cwd = "C:\\\\work\\\\repo"
 # restart_command = ["C:\\\\tools\\\\my-resume.cmd", "{thread_id}"]
 max_restarts_per_day = 6
+
+# Codex desktop app / several sessions at once: let Codex stop itself at the limit, then
+# resume every thread whose last turn hit the limit, inside the app.
+# discover_threads = true
+# restart_mode = "queue"
+# stop_cli = false
+# thread_lookback_hours = 12
+# resume_subagents = false
+# max_threads_per_resume = 8
 
 # codex_path = "C:\\\\Users\\\\me\\\\AppData\\\\Roaming\\\\npm\\\\codex.cmd"
 # app_server_args = ["app-server"]   # older CLIs: ["app-server", "--stdio"]

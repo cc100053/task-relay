@@ -1,8 +1,8 @@
 """Minimal JSON-RPC client for `codex app-server` over stdio.
 
-Only read-only methods are used: `initialize` and `account/rateLimits/read`.
-The app-server is spawned per probe and torn down afterwards, so the watchdog
-never depends on a long-lived Codex session.
+Only read-only methods are used: `initialize`, `account/rateLimits/read`,
+`thread/list` and `thread/turns/list`. The app-server is spawned per probe and
+torn down afterwards, so the watchdog never depends on a long-lived Codex session.
 """
 
 from __future__ import annotations
@@ -111,86 +111,105 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+class AppServerSession:
+    """One `codex app-server` process; send requests with `call`, then close it."""
+
+    def __init__(self, codex: str, args: list[str], timeout: float):
+        try:
+            self.proc = popen_hidden(
+                [*command_prefix(codex), *args],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+        except OSError as exc:
+            raise ProbeError(f"could not start codex app-server: {exc}") from exc
+        self.lines: queue.Queue[str | None] = queue.Queue()
+        self.stderr_tail: list[str] = []
+        self.deadline = time.monotonic() + timeout
+        self.next_id = 0
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
+        threading.Thread(target=self._pump_stderr, daemon=True).start()
+        try:
+            self.call("initialize", {
+                "clientInfo": {"name": "codex_quota_watchdog", "version": __version__},
+            })
+            self._send({"method": "initialized", "params": {}})
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self) -> "AppServerSession":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _pump_stdout(self) -> None:
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def _pump_stderr(self) -> None:
+        for line in self.proc.stderr:
+            self.stderr_tail.append(line.rstrip())
+            del self.stderr_tail[:-20]
+
+    def _send(self, message: dict) -> None:
+        try:
+            self.proc.stdin.write(json.dumps(message) + "\n")
+            self.proc.stdin.flush()
+        except OSError as exc:
+            raise ProbeError(f"app-server stdin closed: {exc}") from exc
+
+    def call(self, method: str, params: dict) -> dict:
+        """Send one request and return its object result, or raise ProbeError."""
+        self.next_id += 1
+        request_id = self.next_id
+        self._send({"id": request_id, "method": method, "params": params})
+        while True:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProbeError("app-server did not answer in time")
+            try:
+                line = self.lines.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if line is None:
+                detail = " | ".join(self.stderr_tail[-3:])
+                raise ProbeError(f"app-server exited early{': ' + detail if detail else ''}")
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue  # notifications and unrelated replies
+            if "error" in message:
+                err = message["error"] or {}
+                raise ProbeError(f"app-server error {err.get('code')}: {err.get('message')}")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise ProbeError("app-server returned a non-object result")
+            return result
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        kill_tree(self.proc)
+
+
 class AppServerClient:
     def __init__(self, codex: str, args: list[str], timeout: float = 30.0):
         self.codex = codex
         self.args = args
         self.timeout = timeout
 
+    def session(self, timeout: float | None = None) -> AppServerSession:
+        return AppServerSession(self.codex, self.args, timeout or self.timeout)
+
     def read_rate_limits(self) -> dict:
         """Return the raw `account/rateLimits/read` result, or raise ProbeError."""
-        try:
-            proc = popen_hidden(
-                [*command_prefix(self.codex), *self.args],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-            )
-        except OSError as exc:
-            raise ProbeError(f"could not start codex app-server: {exc}") from exc
-
-        lines: queue.Queue[str | None] = queue.Queue()
-        stderr_tail: list[str] = []
-
-        def pump_stdout() -> None:
-            for line in proc.stdout:
-                lines.put(line)
-            lines.put(None)
-
-        def pump_stderr() -> None:
-            for line in proc.stderr:
-                stderr_tail.append(line.rstrip())
-                del stderr_tail[:-20]
-
-        threading.Thread(target=pump_stdout, daemon=True).start()
-        threading.Thread(target=pump_stderr, daemon=True).start()
-        deadline = time.monotonic() + self.timeout
-
-        def send(message: dict) -> None:
-            try:
-                proc.stdin.write(json.dumps(message) + "\n")
-                proc.stdin.flush()
-            except OSError as exc:
-                raise ProbeError(f"app-server stdin closed: {exc}") from exc
-
-        def wait_for(request_id: int) -> dict:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ProbeError("app-server did not answer in time")
-                try:
-                    line = lines.get(timeout=remaining)
-                except queue.Empty:
-                    continue
-                if line is None:
-                    detail = " | ".join(stderr_tail[-3:])
-                    raise ProbeError(f"app-server exited early{': ' + detail if detail else ''}")
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(message, dict) or message.get("id") != request_id:
-                    continue  # notifications and unrelated responses
-                if "error" in message:
-                    err = message["error"] or {}
-                    raise ProbeError(f"app-server error {err.get('code')}: {err.get('message')}")
-                result = message.get("result")
-                if not isinstance(result, dict):
-                    raise ProbeError("app-server returned a non-object result")
-                return result
-
-        try:
-            send({"id": 1, "method": "initialize", "params": {
-                "clientInfo": {"name": "codex_quota_watchdog", "version": __version__},
-            }})
-            wait_for(1)
-            send({"method": "initialized", "params": {}})
+        with self.session() as session:
             # Background polls skip the reset-credit detail lookup; the count is still returned.
-            send({"id": 2, "method": "account/rateLimits/read",
-                  "params": {"excludeResetCreditDetails": True}})
-            return wait_for(2)
-        finally:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            kill_tree(proc)
+            return session.call("account/rateLimits/read", {"excludeResetCreditDetails": True})

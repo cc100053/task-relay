@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 from codex_quota_watchdog import procs as real_procs
-from codex_quota_watchdog import restart
+from codex_quota_watchdog import restart, threads
 from codex_quota_watchdog.appserver import ProbeError
 from codex_quota_watchdog.config import Config
 from codex_quota_watchdog.state import MONITORING, NEEDS_USER, WAITING_RESET, StateStore
@@ -13,6 +13,8 @@ from codex_quota_watchdog.watchdog import Watchdog
 from .helpers import rate_limits
 
 TID = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+TID2 = "0199a213-81c0-7800-8aa1-bbab2a035a54"
+TID3 = "0199a213-81c0-7800-8aa1-bbab2a035a55"
 T0 = 1_800_000_000.0
 
 
@@ -277,6 +279,160 @@ class WatchdogTests(unittest.TestCase):
         self.set_quota(five_used=0)
         d.tick()
         self.assertEqual(self.launched, [])
+
+
+class DiscoveryTests(unittest.TestCase):
+    """Desktop app / several sessions: resume every thread that stopped on the usage limit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = StateStore(Path(self.tmp.name, "state.json"))
+        self.clock = Clock()
+        self.client = FakeClient()
+        self.procs = FakeProcs()
+        self.procs.running = []  # the desktop app is not stopped
+        self.cfg = Config(armed=True, discover_threads=True, restart_mode="queue", stop_cli=False,
+                          resume_stagger_seconds=0)
+        self.limited = []
+        self.queued = []
+        self.queue_ok = True
+        self.started = {}
+        for name, fake in (("find_limited", lambda client, cfg, now: list(self.limited)),
+                           ("started_since", lambda client, tid, since: self.started.get(tid))):
+            patcher = mock.patch.object(threads, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(restart, "queue", side_effect=self._fake_queue)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.launched = []
+        patcher = mock.patch.object(restart, "restart", side_effect=lambda args, cwd, jobs, tid:
+                                    self.launched.append((args, cwd)) or FakeJob(thread_id=tid))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _fake_queue(self, args):
+        self.queued.append(args[args.index("--thread") + 1])
+        return self.queue_ok, "" if self.queue_ok else "app not running"
+
+    def dog(self, dry_run=False):
+        return Watchdog(self.cfg, self.store, self.client, "codex", Path(self.tmp.name), dry_run,
+                        clock=self.clock, proc_api=self.procs, sleep=lambda s: None)
+
+    def set_quota(self, **kw):
+        self.client.reply = rate_limits(self.clock.now, **kw)
+
+    def limit_hit(self, *tids):
+        self.limited = [threads.LimitedThread(t, "turn-" + t[-2:], "/work/" + t[-2:], "task", T0, False)
+                        for t in tids]
+
+    def through_reset(self, d):
+        self.set_quota(five_used=99)
+        d.tick()
+        self.assertEqual(d.state.phase, WAITING_RESET)
+        self.clock.now = d.state.resume_after + 1
+        self.set_quota(five_used=0, five_reset=5 * 3600)
+        d.tick(); self.clock.now += 20; d.tick()
+
+    def test_waits_without_stopping_then_queues_every_limited_thread(self):
+        d = self.dog()
+        self.limit_hit(TID, TID2, TID3)
+        self.through_reset(d)
+        self.assertEqual(self.procs.stopped, [])
+        self.assertEqual(self.queued, [TID, TID2, TID3])
+        self.assertEqual(d.state.phase, MONITORING)
+        self.assertEqual(sorted(e["thread_id"] for e in d.state.pending_queue), sorted([TID, TID2, TID3]))
+        self.assertEqual(sorted(d.state.handled_turns), ["turn-53", "turn-54", "turn-55"])
+
+    def test_same_limited_turn_is_never_resumed_twice(self):
+        d = self.dog()
+        self.limit_hit(TID)
+        self.through_reset(d)
+        self.through_reset(d)
+        self.assertEqual(self.queued, [TID])
+
+    def test_no_limited_thread_resumes_nothing(self):
+        d = self.dog()
+        self.through_reset(d)
+        self.assertEqual(self.queued, [])
+        self.assertEqual(d.state.phase, MONITORING)
+
+    def test_queue_failure_needs_user(self):
+        self.queue_ok = False
+        d = self.dog()
+        self.limit_hit(TID, TID2)
+        self.through_reset(d)
+        self.assertEqual(d.state.phase, NEEDS_USER)
+        self.assertIn("app not running", d.state.note)
+
+    def test_thread_cap(self):
+        self.cfg.max_threads_per_resume = 2
+        d = self.dog()
+        self.limit_hit(TID, TID2, TID3)
+        self.through_reset(d)
+        self.assertEqual(self.queued, [TID, TID2])
+        self.assertEqual(d.state.phase, NEEDS_USER)
+        self.assertIn(TID3, d.state.note)
+
+    def test_per_thread_restart_cap(self):
+        self.cfg.max_restarts_per_day = 1
+        d = self.dog()
+        d.state.thread_restarts = {TID: [self.clock.now - 100]}
+        self.limit_hit(TID, TID2)
+        self.through_reset(d)
+        self.assertEqual(self.queued, [TID2])
+        self.assertEqual(d.state.phase, NEEDS_USER)
+
+    def test_queued_message_not_started_needs_user(self):
+        d = self.dog()
+        self.limit_hit(TID, TID2)
+        self.through_reset(d)
+        self.started = {TID: True, TID2: False}
+        self.clock.now += self.cfg.queue_start_timeout_seconds + 1
+        d.tick()
+        self.assertEqual(d.state.phase, NEEDS_USER)
+        self.assertIn(TID2, d.state.note)
+        self.assertNotIn(TID, d.state.note)
+        self.assertEqual(d.state.pending_queue, [])
+
+    def test_queued_messages_started_stay_monitoring(self):
+        d = self.dog()
+        self.limit_hit(TID)
+        self.through_reset(d)
+        self.started = {TID: True}
+        self.clock.now += self.cfg.queue_start_timeout_seconds + 1
+        d.tick()
+        self.assertEqual(d.state.phase, MONITORING)
+        self.assertEqual(d.state.pending_queue, [])
+
+    def test_stopped_cli_sessions_are_all_resumed_with_exec(self):
+        self.cfg.restart_mode = "exec-resume"
+        self.cfg.stop_cli = True
+        self.procs.running = [real_procs.Proc(300, 1, "codex", f"codex resume {TID}", "t1"),
+                              real_procs.Proc(301, 1, "codex", f"codex exec resume {TID2} go", "t2")]
+        d = self.dog()
+        self.limit_hit(TID3)
+        self.through_reset(d)
+        self.assertEqual(self.procs.stopped, [[300, 301]])
+        resumed = [args[args.index("resume") + 1] for args, _ in self.launched]
+        self.assertEqual(sorted(resumed), sorted([TID, TID2, TID3]))
+        self.assertIn(("/work/55"), [cwd for _, cwd in self.launched])
+        self.assertEqual(d.state.phase, MONITORING)
+
+    def test_dry_run_queues_nothing(self):
+        d = self.dog(dry_run=True)
+        self.limit_hit(TID)
+        self.through_reset(d)
+        self.assertEqual(self.queued, [])
+        self.assertEqual(d.state.handled_turns, [])
+
+    def test_thread_list_failure_keeps_waiting(self):
+        d = self.dog()
+        threads.find_limited.side_effect = ProbeError("down")
+        self.through_reset(d)
+        self.assertEqual(d.state.phase, WAITING_RESET)
+        self.assertEqual(self.queued, [])
 
 
 if __name__ == "__main__":

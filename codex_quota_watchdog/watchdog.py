@@ -9,7 +9,7 @@ import logging
 import time
 from pathlib import Path
 
-from . import procs, quota, restart
+from . import procs, quota, restart, threads
 from .appserver import ProbeError
 from .config import Config
 from .state import DONE, MONITORING, NEEDS_USER, WAITING_RESET, State, StateStore
@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 class Watchdog:
     def __init__(self, cfg: Config, store: StateStore, client, codex: str, jobs_dir: Path,
-                 dry_run: bool, clock=time.time, proc_api=procs):
+                 dry_run: bool, clock=time.time, proc_api=procs, sleep=time.sleep):
         self.cfg = cfg
         self.store = store
         self.client = client
@@ -28,8 +28,10 @@ class Watchdog:
         self.dry_run = dry_run
         self.clock = clock
         self.procs = proc_api
+        self.sleep = sleep
         self.state: State = store.load()
         self.job: restart.Job | None = None
+        self.resumed_jobs: list[restart.Job] = []  # discovery-mode restarts, not guarded as `cqw run`
         self._unknown_streak = 0
         self._healthy_streak = 0
         self._last_parked_note = ""
@@ -90,33 +92,47 @@ class Watchdog:
 
         reasons = quota.stop_reasons(snap, self.cfg)
         if not reasons:
+            if self.state.pending_queue and self._check_pending_queue():
+                return self.cfg.poll_seconds
             return self.cfg.near_limit_poll_seconds if quota.near_limit(snap, self.cfg) else self.cfg.poll_seconds
 
         targets = self._targets()
         if not targets:
+            if self.cfg.discover_threads:
+                log.warning("quota threshold reached: %s; no Codex process to stop, Codex will stop "
+                            "itself at the limit", "; ".join(reasons))
+                return self._enter_waiting(snap, reasons, None, [])
             log.info("quota low (%s) but no Codex process is running", "; ".join(reasons))
             return self.cfg.near_limit_poll_seconds
 
         log.warning("quota threshold reached: %s", "; ".join(reasons))
-        thread_id = self._pick_thread_id(targets)
+        if self.cfg.discover_threads:
+            thread_id, thread_ids = None, self._all_thread_ids(targets)
+        else:
+            thread_id, thread_ids = self._pick_thread_id(targets), []
         if self.job:
             self.job.stopped_by_watchdog = True
         stopped = self.procs.stop_processes(targets, self.cfg, dry_run=self.dry_run)
         if not stopped:
             self._park(NEEDS_USER, "some Codex processes could not be stopped; see log")
             return self.cfg.poll_seconds
+        return self._enter_waiting(snap, reasons, thread_id, thread_ids)
 
+    def _enter_waiting(self, snap: quota.Snapshot, reasons: list[str], thread_id: str | None,
+                       thread_ids: list[str]) -> float:
         self.state.phase = WAITING_RESET
         self.state.stopped_at = self.clock()
         self.state.stop_reasons = reasons
         self.state.account_id = snap.account_id
         self.state.thread_id = thread_id
+        self.state.thread_ids = thread_ids
         self.state.cwd = self.cfg.restart_cwd or self.state.cwd
         self.state.resume_after = quota.resume_after(snap, self.cfg)
         self.state.note = ""
         self._healthy_streak = 0
-        log.info("stopped Codex; thread=%s; will re-check after %s",
-                 thread_id or "none", quota.fmt_ts(self.state.resume_after))
+        shown = ", ".join(thread_ids) if thread_ids else thread_id or "none"
+        log.info("waiting for the reset; thread(s)=%s; will re-check after %s",
+                 shown, quota.fmt_ts(self.state.resume_after))
         return self._sleep_until_resume()
 
     def _targets(self) -> list:
@@ -157,6 +173,14 @@ class Watchdog:
             log.warning("several thread ids in stopped processes (%s); not guessing", ", ".join(ids))
             return None
         return self.cfg.thread_id or self.state.thread_id or None
+
+    def _all_thread_ids(self, targets) -> list[str]:
+        """Discovery mode: every exact thread id known for the stopped processes (no guessing)."""
+        ids = [self.job.thread_id] if self.job and self.job.thread_id else []
+        ids += [t for t in self.procs.thread_ids_from(targets) if t not in ids]
+        if not ids and self.cfg.thread_id:
+            ids.append(self.cfg.thread_id)
+        return ids
 
     # ---------------------------------------------------------------- waiting
     def _sleep_until_resume(self) -> float:
@@ -200,6 +224,8 @@ class Watchdog:
             log.info("quota available again; restart_mode=none, so nothing is started")
             self._back_to_monitoring()
             return self.cfg.poll_seconds
+        if self.cfg.discover_threads:
+            return self._resume_threads(now)
         if self.state.restarts_last_day(now) >= self.cfg.max_restarts_per_day:
             self._park(NEEDS_USER, f"max_restarts_per_day ({self.cfg.max_restarts_per_day}) reached")
             return self.cfg.poll_seconds
@@ -210,6 +236,12 @@ class Watchdog:
             return self.cfg.poll_seconds
         if self.dry_run:
             log.warning("[dry-run] would restart: %s", " ".join(args))
+        elif self.cfg.restart_mode == "queue":
+            ok, detail = restart.queue(args)
+            if not ok:
+                self._park(NEEDS_USER, f"codex queue failed for {self.state.thread_id}: {detail}")
+                return self.cfg.poll_seconds
+            self.state.pending_queue.append({"thread_id": self.state.thread_id, "queued_at": now})
         else:
             try:
                 self.job = restart.restart(args, self.state.cwd, self.jobs_dir, self.state.thread_id)
@@ -221,10 +253,111 @@ class Watchdog:
         self._back_to_monitoring()
         return self.cfg.poll_seconds
 
+    def _resume_threads(self, now: float) -> float:
+        """Discovery mode: resume every thread that stopped on the limit, each by its exact id."""
+        try:
+            limited = threads.find_limited(self.client, self.cfg, now)
+        except ProbeError as exc:
+            log.warning("could not list threads (%s); not resuming yet", exc)
+            return self.cfg.poll_seconds
+
+        candidates: dict[str, tuple[str | None, str | None]] = {}
+        for t in limited:
+            if t.turn_id in self.state.handled_turns:
+                continue
+            candidates[t.thread_id] = (t.turn_id, t.cwd)
+            log.info("thread %s stopped on the usage limit (%s)", t.thread_id, t.title or "untitled")
+        for tid in [*self.state.thread_ids, *([self.state.thread_id] if self.state.thread_id else [])]:
+            if restart.valid_thread_id(tid) and tid not in candidates:
+                candidates[tid] = (None, self.state.cwd)  # a process the watchdog stopped itself
+
+        if not candidates:
+            log.info("quota available again; no thread stopped on the usage limit, nothing to resume")
+            self._back_to_monitoring()
+            return self.cfg.poll_seconds
+
+        failures, skipped = [], []
+        resumed = 0
+        for tid, (turn_id, cwd) in candidates.items():
+            if resumed >= self.cfg.max_threads_per_resume:
+                skipped.append(tid)
+                continue
+            if self.state.restarts_last_day(now, tid) >= self.cfg.max_restarts_per_day:
+                failures.append(f"{tid}: max_restarts_per_day reached")
+                continue
+            if resumed:
+                self.sleep(self.cfg.resume_stagger_seconds)
+            error = self._resume_one(tid, cwd or self.cfg.restart_cwd or None, now)
+            if error:
+                failures.append(f"{tid}: {error}")
+                continue
+            resumed += 1
+            if not self.dry_run:
+                self.state.thread_restarts.setdefault(tid, []).append(now)
+                if turn_id:
+                    self.state.handled_turns.append(turn_id)
+
+        if resumed and not self.dry_run:
+            self.state.restart_history.append(now)
+        log.info("resumed %d thread(s)%s", resumed, " (dry run)" if self.dry_run else "")
+        if skipped:
+            failures.append(f"not resumed (max_threads_per_resume={self.cfg.max_threads_per_resume}): "
+                            + ", ".join(skipped))
+        if failures:
+            self._park(NEEDS_USER, "; ".join(failures))
+        else:
+            self._back_to_monitoring()
+        return self.cfg.poll_seconds
+
+    def _resume_one(self, tid: str, cwd: str | None, now: float) -> str | None:
+        """Resume one thread; return an error text, or None on success."""
+        try:
+            args = restart.build_restart_args(self.codex, self.cfg, tid, cwd)
+        except ValueError as exc:
+            return str(exc)
+        if self.dry_run:
+            log.warning("[dry-run] would resume %s: %s", tid, " ".join(args))
+            return None
+        if self.cfg.restart_mode == "queue":
+            ok, detail = restart.queue(args)
+            if not ok:
+                return f"codex queue failed: {detail}"
+            self.state.pending_queue.append({"thread_id": tid, "queued_at": now})
+            return None
+        try:
+            self.resumed_jobs.append(restart.restart(args, cwd, self.jobs_dir, tid))
+        except (OSError, ValueError) as exc:
+            return f"restart failed to launch: {exc}"
+        self.resumed_jobs = [j for j in self.resumed_jobs if j.poll() is None]
+        return None
+
+    def _check_pending_queue(self) -> bool:
+        """Queued messages are sent by the desktop app. Park if one never started. True = parked."""
+        now = self.clock()
+        due = [e for e in self.state.pending_queue
+               if now - e.get("queued_at", now) >= self.cfg.queue_start_timeout_seconds]
+        not_started = []
+        for entry in due:
+            started = threads.started_since(self.client, entry["thread_id"], entry["queued_at"])
+            if started is None:
+                continue  # unreadable: check again next time
+            self.state.pending_queue.remove(entry)
+            if started:
+                log.info("queued message started on thread %s", entry["thread_id"])
+            else:
+                not_started.append(entry["thread_id"])
+        if not_started:
+            self._park(NEEDS_USER, "queued message not started on " + ", ".join(not_started)
+                       + "; open these threads in the Codex app (it sends queued messages), "
+                         "or use restart_mode = \"exec-resume\"")
+            return True
+        return False
+
     def _back_to_monitoring(self) -> None:
         self.state.phase = MONITORING
         self.state.resume_after = None
         self.state.stop_reasons = []
+        self.state.thread_ids = []
         self.state.note = ""
 
     # ----------------------------------------------------------------- parked

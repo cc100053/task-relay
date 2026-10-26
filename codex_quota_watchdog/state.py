@@ -30,9 +30,16 @@ class State:
     last_summary: list[str] = field(default_factory=list)
     # Job started by `cqw run`; restarted only through its exact thread id.
     managed_pid: int | None = None
+    # Thread discovery: every thread id to resume, resume times per thread, turns already
+    # handled (never resumed twice), and queued messages not yet seen starting.
+    thread_ids: list[str] = field(default_factory=list)
+    thread_restarts: dict[str, list[float]] = field(default_factory=dict)
+    handled_turns: list[str] = field(default_factory=list)
+    pending_queue: list[dict] = field(default_factory=list)
 
-    def restarts_last_day(self, now: float) -> int:
-        return sum(1 for t in self.restart_history if now - t < 86400)
+    def restarts_last_day(self, now: float, thread_id: str | None = None) -> int:
+        times = self.thread_restarts.get(thread_id, []) if thread_id else self.restart_history
+        return sum(1 for t in times if now - t < 86400)
 
 
 class StateStore:
@@ -53,7 +60,11 @@ class StateStore:
     def save(self, state: State) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        state.restart_history = [t for t in state.restart_history if time.time() - t < 7 * 86400]
+        week_ago = time.time() - 7 * 86400
+        state.restart_history = [t for t in state.restart_history if t > week_ago]
+        state.thread_restarts = {k: [t for t in v if t > week_ago]
+                                 for k, v in state.thread_restarts.items() if any(t > week_ago for t in v)}
+        state.handled_turns = state.handled_turns[-500:]
         tmp.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
         os.replace(tmp, self.path)
 

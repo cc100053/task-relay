@@ -100,6 +100,10 @@ def build_restart_args(codex: str, cfg: Config, thread_id: str | None, cwd: str 
         if not valid_thread_id(thread_id):
             raise ValueError("no exact thread UUID recorded; refusing to guess (no --last)")
         return [*command_prefix(codex), "exec", *cfg.exec_extra_args, "resume", thread_id, cfg.resume_prompt]
+    if cfg.restart_mode == "queue":
+        if not valid_thread_id(thread_id):
+            raise ValueError("no exact thread UUID recorded; refusing to guess")
+        return [*command_prefix(codex), "queue", "--thread", thread_id, "--message", cfg.resume_prompt]
     if cfg.restart_mode == "command":
         values = {"codex": codex, "thread_id": thread_id or "", "prompt": cfg.resume_prompt,
                   "cwd": cwd or ""}
@@ -114,3 +118,17 @@ def restart(args: list[str], cwd: str | None, jobs_dir: Path, thread_id: str | N
     if thread_id:
         job.thread_id = thread_id
     return job
+
+
+def queue(args: list[str], timeout: float = 120.0) -> tuple[bool, str]:
+    """Run `codex queue ...` to completion; it only stores the message, so it returns quickly."""
+    check_cmd_safe(args)
+    log.info("queueing: %s", _show(args))
+    try:
+        done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    lines = [ln for ln in (done.stdout + done.stderr).splitlines()
+             if ln.strip() and not ln.lstrip().startswith(("WARNING", "Stack backtrace")) and ": <unknown>" not in ln]
+    return done.returncode == 0, " | ".join(lines[-3:])

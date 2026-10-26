@@ -1,4 +1,4 @@
-"""Command line: cqw doctor | status | watch | run | clear | stop | init-config | autostart | logs."""
+"""Command line: cqw doctor | status | threads | watch | run | clear | stop | init-config | autostart | logs."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, autostart, procs, quota
+from . import __version__, autostart, procs, quota, threads
 from .appserver import AppServerClient, ProbeError, find_codex
 from .config import SAMPLE_CONFIG, ConfigError, data_dir, default_config_path, load_config
 from .restart import valid_thread_id
@@ -93,9 +93,46 @@ def cmd_status(args) -> int:
             print(f"  waiting until: {quota.fmt_ts(st.resume_after)}")
         if st.thread_id:
             print(f"  thread to resume: {st.thread_id}")
+        if st.thread_ids:
+            print(f"  threads to resume: {', '.join(st.thread_ids)}")
+        for entry in st.pending_queue:
+            print(f"  queued, waiting for the app to start it: {entry.get('thread_id')} "
+                  f"(since {quota.fmt_ts(entry.get('queued_at'))})")
         if st.stop_reasons:
             print(f"  stopped because: {'; '.join(st.stop_reasons)}")
     return 0 if snap else 1
+
+
+def cmd_threads(args) -> int:
+    cfg = _load(args)
+    if args.hours:
+        cfg.thread_lookback_hours = args.hours
+    try:
+        client = AppServerClient(find_codex(cfg.codex_path), cfg.app_server_args, cfg.probe_timeout_seconds)
+        now = time.time()
+        if args.all:
+            with client.session() as session:
+                rows = threads.recent_threads(session, cfg, now - cfg.thread_lookback_hours * 3600)
+                print(f"Threads updated in the last {cfg.thread_lookback_hours:g} h: {len(rows)}")
+                for t in rows:
+                    turn = threads.latest_turn(session, t["id"])
+                    last = f"{turn.status}{' / ' + turn.error_kind if turn.error_kind else ''}" if turn else "no turns"
+                    title = " ".join(str(t.get("name") or t.get("preview") or "").split())[:50]
+                    print(f"  {t['id']}  {last:<32} {title}")
+            return 0
+        limited = threads.find_limited(client, cfg, now)
+    except ProbeError as exc:
+        print(f"could not read threads: {exc}", file=sys.stderr)
+        return 1
+    print(f"Threads whose last turn stopped on the usage limit (last {cfg.thread_lookback_hours:g} h): "
+          f"{len(limited)}")
+    for t in limited:
+        kind = " [sub-agent]" if t.subagent else ""
+        print(f"  {t.thread_id}  ended {quota.fmt_ts(t.completed_at)}{kind}  {t.title}")
+        print(f"      cwd: {t.cwd or '?'}")
+    if limited:
+        print(f"With discover_threads = true these are resumed after the reset (restart_mode = {cfg.restart_mode}).")
+    return 0
 
 
 def cmd_doctor(args) -> int:
@@ -133,6 +170,14 @@ def cmd_doctor(args) -> int:
         ok = False
     print(f"[..] armed: {cfg.armed} ({'will stop/start processes' if cfg.armed else 'dry run unless --arm'})")
     print(f"[..] restart_mode: {cfg.restart_mode}")
+    if cfg.discover_threads:
+        try:
+            client = AppServerClient(find_codex(cfg.codex_path), cfg.app_server_args, cfg.probe_timeout_seconds)
+            limited = threads.find_limited(client, cfg, time.time())
+            print(f"[ok] thread discovery works; threads stopped on the limit now: {len(limited)} (`cqw threads`)")
+        except ProbeError as exc:
+            print(f"[!!] thread discovery failed: {exc}")
+            ok = False
     if cfg.restart_mode == "exec-resume" and cfg.thread_id and not valid_thread_id(cfg.thread_id):
         print("[!!] thread_id is not a valid UUID")
         ok = False
@@ -191,7 +236,8 @@ def cmd_clear(args) -> int:
         store = StateStore(paths(dry)["state"])
         if store.path.exists():
             old = store.load()
-            store.save(State(phase=MONITORING, restart_history=old.restart_history))
+            store.save(State(phase=MONITORING, restart_history=old.restart_history,
+                             thread_restarts=old.thread_restarts, handled_turns=old.handled_turns))
     print("state reset to monitoring (a running watchdog picks this up after restarting it)")
     return 0
 
@@ -256,6 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check codex, quota access, process matching").set_defaults(func=cmd_doctor)
     sub.add_parser("status", help="show live quota, next reset and watchdog state").set_defaults(func=cmd_status)
+    t = sub.add_parser("threads", help="list threads whose last turn stopped on the usage limit")
+    t.add_argument("--all", action="store_true", help="list every recent thread with its last turn status")
+    t.add_argument("--hours", type=float, help="look back this many hours (default: thread_lookback_hours)")
+    t.set_defaults(func=cmd_threads)
 
     def loop_flags(p):
         p.add_argument("--arm", action="store_true", help="really stop/start processes (overrides armed=false)")
