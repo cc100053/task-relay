@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-quota-watchdog"
+version = "0.1.0"
+description = "Local watchdog that stops Codex near its ChatGPT usage limit, waits for the official reset, and resumes the exact thread."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+cqw = "codex_quota_watchdog.cli:main"
+
+[tool.setuptools]
+packages = ["codex_quota_watchdog"]
