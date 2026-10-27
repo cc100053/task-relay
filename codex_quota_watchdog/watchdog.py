@@ -128,9 +128,19 @@ class Watchdog:
         try:
             turn = desktop.latest_turn(self.cfg.thread_id)
         except desktop.DesktopError as exc:
-            self._park(NEEDS_USER, str(exc))
+            # Nothing is pending yet, so a transient read error just waits for the next poll.
+            log.warning("%s; retrying next poll", exc)
             return self.cfg.poll_seconds
+        if self.state.desktop_registered_thread_id != self.cfg.thread_id:
+            self.state.desktop_registered_thread_id = self.cfg.thread_id
+            self.state.desktop_baseline_turn_id = turn.turn_id
+            if turn.quota_limited and not self.cfg.desktop_recover_existing_failure:
+                log.warning("desktop chat already ended on a quota failure when registered (turn=%s); "
+                            "not recovering it (set desktop_recover_existing_failure = true to allow)",
+                            turn.turn_id)
         if not turn.quota_limited or turn.turn_id == self.state.desktop_attempted_turn_id:
+            return self.cfg.poll_seconds
+        if turn.turn_id == self.state.desktop_baseline_turn_id and not self.cfg.desktop_recover_existing_failure:
             return self.cfg.poll_seconds
         self.state.phase = WAITING_RESET
         self.state.thread_id = turn.thread_id
@@ -255,27 +265,33 @@ class Watchdog:
             self._park(NEEDS_USER, "desktop recovery registration changed or no failed turn was recorded")
             return self.cfg.poll_seconds
         if self.state.desktop_attempted_turn_id == self.state.desktop_turn_id:
-            self._park(NEEDS_USER, "desktop delivery was already attempted; inspect the chat before retrying")
+            self._park(NEEDS_USER, "desktop delivery was already attempted for this turn and is never "
+                                   "resent automatically; inspect the chat and continue it by hand")
             return self.cfg.poll_seconds
         try:
             turn = desktop.latest_turn(self.cfg.thread_id)
-            if turn.turn_id != self.state.desktop_turn_id or not turn.quota_limited:
-                log.info("desktop chat advanced or no longer has a quota failure; cancelling recovery")
-                self._back_to_monitoring()
-                return self.cfg.poll_seconds
-            # Persist before sending: a crash or ambiguous timeout must never duplicate delivery.
-            self.state.desktop_attempted_turn_id = turn.turn_id
-            self.state.restart_history.append(now)
-            self.store.save(self.state)
-            if self.dry_run:
-                log.warning("[dry-run] would queue desktop continuation: thread=%s turn=%s", turn.thread_id, turn.turn_id)
-            else:
+        except desktop.DesktopError as exc:
+            # Nothing was sent yet: keep waiting and re-confirm quota before the next attempt.
+            log.warning("%s; delivery not attempted, retrying next poll", exc)
+            return self.cfg.poll_seconds
+        if turn.turn_id != self.state.desktop_turn_id or not turn.quota_limited:
+            log.info("desktop chat advanced or no longer has a quota failure; cancelling recovery")
+            self._back_to_monitoring()
+            return self.cfg.poll_seconds
+        # Persist before sending: a crash or ambiguous timeout must never duplicate delivery.
+        self.state.desktop_attempted_turn_id = turn.turn_id
+        self.state.restart_history.append(now)
+        self.store.save(self.state)
+        if self.dry_run:
+            log.warning("[dry-run] would queue desktop continuation: thread=%s turn=%s", turn.thread_id, turn.turn_id)
+        else:
+            try:
                 desktop.queue_resume(self.codex, turn.thread_id, self.cfg.resume_prompt,
                                      self.cfg.probe_timeout_seconds)
-                log.info("desktop continuation queued: thread=%s turn=%s", turn.thread_id, turn.turn_id)
-        except (desktop.DesktopError, ValueError) as exc:
-            self._park(NEEDS_USER, str(exc))
-            return self.cfg.poll_seconds
+            except (desktop.DesktopError, ValueError) as exc:
+                self._park(NEEDS_USER, str(exc))
+                return self.cfg.poll_seconds
+            log.info("desktop continuation queued: thread=%s turn=%s", turn.thread_id, turn.turn_id)
         self._back_to_monitoring()
         return self.cfg.poll_seconds
 

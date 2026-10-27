@@ -7,7 +7,7 @@ from codex_quota_watchdog import procs as real_procs
 from codex_quota_watchdog import desktop, restart
 from codex_quota_watchdog.appserver import ProbeError
 from codex_quota_watchdog.config import Config
-from codex_quota_watchdog.state import MONITORING, NEEDS_USER, WAITING_RESET, StateStore
+from codex_quota_watchdog.state import MONITORING, NEEDS_USER, WAITING_RESET, State, StateStore
 from codex_quota_watchdog.watchdog import Watchdog
 
 from .helpers import rate_limits
@@ -293,6 +293,11 @@ class DesktopWatchdogTests(WatchdogTestCase):
         patcher = mock.patch.object(desktop, "queue_resume")
         self.queue = patcher.start()
         self.addCleanup(patcher.stop)
+        self.register()
+
+    def register(self):
+        # The chat was registered before this failure happened.
+        self.store.save(State(desktop_registered_thread_id=TID))
 
     def ready(self, dog):
         self.clock.now = dog.state.resume_after + 1
@@ -359,14 +364,55 @@ class DesktopWatchdogTests(WatchdogTestCase):
         self.queue.assert_called_once()
         self.assertEqual(self.procs.stopped, [])
 
-    def test_desktop_missing_history_does_not_stop_or_queue(self):
-        self.latest.side_effect = desktop.DesktopError("history unavailable")
+    def test_desktop_read_error_retries_without_parking_stopping_or_queueing(self):
+        self.latest.side_effect = desktop.DesktopError("database is locked")
         d = self.dog()
         self.set_quota(five_used=100)
         d.tick()
-        self.assertEqual(d.state.phase, NEEDS_USER)
+        self.assertEqual(d.state.phase, MONITORING)
+        self.latest.side_effect = None
+        d.tick()
+        self.assertEqual(d.state.phase, WAITING_RESET)
         self.assertEqual(self.procs.stopped, [])
         self.queue.assert_not_called()
+
+    def test_desktop_read_error_at_delivery_keeps_waiting(self):
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.latest.side_effect = desktop.DesktopError("database is locked")
+        self.ready(d)
+        self.assertEqual(d.state.phase, WAITING_RESET)
+        self.assertIsNone(d.state.desktop_attempted_turn_id)
+        self.latest.side_effect = None
+        self.clock.now += self.cfg.poll_seconds
+        d.tick()
+        self.clock.now += self.cfg.confirm_interval_seconds
+        d.tick()
+        self.queue.assert_called_once()
+
+    def test_desktop_failure_present_at_registration_ignored_unless_opted_in(self):
+        for opt_in in (False, True):
+            with self.subTest(opt_in=opt_in):
+                self.store.path.unlink(missing_ok=True)
+                self.cfg.desktop_recover_existing_failure = opt_in
+                d = self.dog()
+                self.set_quota(five_used=100)
+                d.tick()
+                self.assertEqual(d.state.desktop_baseline_turn_id, self.turn.turn_id)
+                self.assertEqual(d.state.phase, WAITING_RESET if opt_in else MONITORING)
+                self.dog().tick()  # baseline survives a watchdog restart
+                self.assertEqual(self.store.load().desktop_baseline_turn_id, self.turn.turn_id)
+
+    def test_desktop_failure_after_registration_recovered(self):
+        self.store.path.unlink()
+        self.latest.return_value = desktop.DesktopTurn(TID, TID, "completed", False, "/work")
+        d = self.dog()
+        self.set_quota(five_used=0)
+        d.tick()
+        self.latest.return_value = self.turn
+        d.tick()
+        self.assertEqual(d.state.phase, WAITING_RESET)
 
     def test_desktop_new_registration_cannot_resume_old_thread(self):
         d = self.dog()
@@ -402,7 +448,7 @@ class DesktopWatchdogTests(WatchdogTestCase):
     def test_desktop_account_change_and_restart_cap_block_delivery(self):
         for capped in (False, True):
             with self.subTest(capped=capped):
-                self.store.path.unlink(missing_ok=True)
+                self.register()
                 d = self.dog()
                 self.set_quota(five_used=100, account="original")
                 d.tick()

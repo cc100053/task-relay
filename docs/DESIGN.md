@@ -97,7 +97,14 @@ into Codex (no hooks, no AGENTS.md edits, no proxy), so Codex upgrades can't bre
 * Read `threads` metadata from `state_5.sqlite` and the latest `thread_turns` entry from
   `thread_history_1.sqlite`, both in SQLite read-only mode. Require a non-archived local
   `Codex Desktop` originator and structured `failed` / `usageLimitExceeded` evidence.
-  Missing or incompatible schemas fail closed. Do not write Codex databases.
+  Missing or incompatible schemas fail closed. Do not write Codex databases. A read error
+  while monitoring, or before delivery, is retried on the next poll; nothing is sent until a
+  read succeeds.
+* Record the chat's latest turn when it is first registered. A quota failure that was
+  already there is ignored unless `desktop_recover_existing_failure = true`, so stale or
+  abandoned chats are not continued.
+* Probe `codex queue --help` for `--thread` and `--message`; a CLI without `queue` can treat
+  it as a prompt and exit 0.
 * Desktop mode never calls process stopping or headless restart. Reuse reset waiting,
   healthy confirmations, account-change protection and restart caps from the CLI loop.
 * Re-read the latest turn immediately before sending. If the user continued or completed

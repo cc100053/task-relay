@@ -52,14 +52,24 @@ def latest_turn(thread_id: str) -> DesktopTurn:
         error = json.loads(turn[2]) if turn[2] else None
         if error is not None and not isinstance(error, dict):
             raise DesktopError("invalid desktop turn error")
-        limited = turn[1] == "failed" and isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded"
+        limited = turn[1] == "failed" and isinstance(error, dict) and _is_usage_limit(error.get("codexErrorInfo"))
         return DesktopTurn(thread_id, turn[0], turn[1], limited, row[0])
     except (sqlite3.Error, OSError, ValueError) as exc:
         raise DesktopError(f"cannot read desktop chat state: {exc}") from exc
 
 
+def _is_usage_limit(info) -> bool:
+    # Unit variants serialize as a string, data-carrying ones as a single-key object.
+    if isinstance(info, dict):
+        return list(info) == ["usageLimitExceeded"]
+    return info == "usageLimitExceeded"
+
+
 def check_queue(codex: str, timeout: float) -> None:
-    _queue_command([*command_prefix(codex), "queue", "--help"], timeout)
+    # A CLI without `queue` may treat it as a prompt and print top-level help, so check the flags.
+    out = _queue_command([*command_prefix(codex), "queue", "--help"], timeout)
+    if "--thread" not in out or "--message" not in out:
+        raise DesktopError("this codex CLI has no `queue --thread --message` command")
 
 
 def queue_resume(codex: str, thread_id: str, prompt: str, timeout: float) -> None:
@@ -68,18 +78,19 @@ def queue_resume(codex: str, thread_id: str, prompt: str, timeout: float) -> Non
     _queue_command([*command_prefix(codex), "queue", "--thread", thread_id, "--message", prompt], timeout)
 
 
-def _queue_command(args: list[str], timeout: float) -> None:
+def _queue_command(args: list[str], timeout: float) -> str:
     check_cmd_safe(args)
     try:
         with popen_hidden(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, encoding="utf-8", errors="replace") as proc:
             try:
-                _, stderr = proc.communicate(timeout=timeout)
+                stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 kill_tree(proc)
                 proc.communicate()
                 raise DesktopError("desktop queue timed out; delivery is uncertain, not retrying")
             if proc.returncode:
                 raise DesktopError(f"desktop queue failed: {stderr.strip()[:300]}")
+            return stdout + stderr
     except OSError as exc:
         raise DesktopError(f"cannot run desktop queue: {exc}") from exc

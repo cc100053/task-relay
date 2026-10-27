@@ -87,6 +87,16 @@ class ProcTests(unittest.TestCase):
         targets = procs.find_targets(Config(), procs=processes, own_pid=500)
         self.assertEqual([p.pid for p in targets], [701])
 
+    def test_linux_truncated_comm_still_cli(self):
+        # Linux truncates comm to 15 chars: codex-x86_64-unknown-linux-musl -> codex-x86_64-un.
+        listing = "800 1 Mon Oct 26 10:00:05 2026 /opt/codex/codex-x86_64-unknown-linux-musl exec task\n"
+        replies = [SimpleNamespace(returncode=0, stdout=listing),
+                   SimpleNamespace(returncode=0, stdout="800 codex-x86_64-un\n")]
+        with patch.object(procs.subprocess, "run", side_effect=replies):
+            processes = procs._list_posix()
+        self.assertEqual(processes[0].name, "codex-x86_64-un")
+        self.assertEqual(procs.classify(processes[0], Config()), "cli")
+
 
 if __name__ == "__main__":
     unittest.main()

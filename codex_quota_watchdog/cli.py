@@ -217,7 +217,9 @@ def cmd_clear(args) -> int:
         if store.path.exists():
             old = store.load()
             store.save(State(phase=MONITORING, restart_history=old.restart_history,
-                             desktop_attempted_turn_id=old.desktop_attempted_turn_id))
+                             desktop_attempted_turn_id=old.desktop_attempted_turn_id,
+                             desktop_registered_thread_id=old.desktop_registered_thread_id,
+                             desktop_baseline_turn_id=old.desktop_baseline_turn_id))
     print("state reset to monitoring (a running watchdog picks this up after restarting it)")
     return 0
 

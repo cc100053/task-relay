@@ -33,6 +33,9 @@ class State:
     # Desktop failure selected for recovery, and the last delivery attempted (never auto-retry).
     desktop_turn_id: str | None = None
     desktop_attempted_turn_id: str | None = None
+    # Thread whose turns are being watched, and its latest turn when first registered.
+    desktop_registered_thread_id: str | None = None
+    desktop_baseline_turn_id: str | None = None
 
     def restarts_last_day(self, now: float) -> int:
         return sum(1 for t in self.restart_history if now - t < 86400)

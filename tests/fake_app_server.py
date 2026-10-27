@@ -14,11 +14,15 @@ for line in sys.stdin:
     elif msg.get("method") == "initialized":
         assert msg.get("params") is None
     elif msg.get("method") == "account/rateLimits/read":
-        if msg.get("params") is not None:
+        params = msg.get("params")
+        if mode == "legacy" and params is not None:
+            # Older CLIs take this request without params.
             print(json.dumps({"id": msg["id"], "error": {
                 "code": -32600, "message": "Invalid request: invalid type: map, expected unit",
             }}), flush=True)
             continue
+        if mode != "legacy":
+            assert params == {"excludeResetCreditDetails": True}
         if mode == "hang":
             continue
         print(json.dumps({"method": "account/rateLimits/updated", "params": {}}), flush=True)

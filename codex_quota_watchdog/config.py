@@ -91,6 +91,9 @@ class Config:
     restart_cwd: str = ""
     # Thread to resume when none was captured automatically.
     thread_id: str = ""
+    # desktop-queue: also recover a quota failure that was already the chat's latest turn
+    # when the thread was first registered (off: only failures seen after registration).
+    desktop_recover_existing_failure: bool = False
     # Safety valve against restart loops.
     max_restarts_per_day: int = 6
 
@@ -159,8 +162,10 @@ def validate(cfg: Config) -> None:
     if cfg.restart_mode == "command" and not cfg.restart_command:
         raise ConfigError("restart_mode = 'command' needs restart_command")
     if cfg.restart_mode == "desktop-queue":
+        # The desktop database stores lowercase ids and compares them case-sensitively.
+        cfg.thread_id = cfg.thread_id.lower()
         try:
-            valid = str(UUID(cfg.thread_id)) == cfg.thread_id.lower()
+            valid = str(UUID(cfg.thread_id)) == cfg.thread_id
         except ValueError:
             valid = False
         if not valid:
@@ -195,6 +200,7 @@ terminate_timeout_seconds = 20
 restart_mode = "exec-resume"
 # exec_extra_args = ["--sandbox", "workspace-write"]
 # thread_id = "00000000-0000-0000-0000-000000000000"
+# desktop_recover_existing_failure = false
 # restart_cwd = "C:\\\\work\\\\repo"
 # restart_command = ["C:\\\\tools\\\\my-resume.cmd", "{thread_id}"]
 max_restarts_per_day = 6

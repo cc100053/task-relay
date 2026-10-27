@@ -40,6 +40,8 @@ class DesktopTests(unittest.TestCase):
     def test_only_structured_quota_failure_is_recoverable(self):
         for status, error, expected in [
             ("failed", {"codexErrorInfo": "usageLimitExceeded"}, True),
+            ("failed", {"codexErrorInfo": {"usageLimitExceeded": {"resetsAt": 1}}}, True),
+            ("failed", {"codexErrorInfo": {"usageLimitExceeded": {}, "other": {}}}, False),
             ("failed", {"message": "usage limit exceeded"}, False),
             ("failed", {"codexErrorInfo": "serverOverloaded"}, False),
             ("failed", {"codexErrorInfo": "unauthorized"}, False),
@@ -97,6 +99,16 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(desktop.DesktopError):
             desktop.queue_resume("codex", "--last", "Continue", 10)
 
+    def test_queue_check_requires_thread_and_message_flags(self):
+        with mock.patch.object(desktop, "popen_hidden") as spawn:
+            proc = spawn.return_value.__enter__.return_value
+            proc.returncode = 0
+            proc.communicate.return_value = ("Usage: codex [OPTIONS] [PROMPT]", "")
+            with self.assertRaisesRegex(desktop.DesktopError, "no `queue"):
+                desktop.check_queue("codex", 10)
+            proc.communicate.return_value = ("Usage: codex queue --thread <ID> --message <TEXT>", "")
+            desktop.check_queue("codex", 10)
+
     def test_queue_failure_and_timeout_report_uncertain_delivery(self):
         with mock.patch.object(desktop, "popen_hidden") as spawn:
             proc = spawn.return_value.__enter__.return_value
@@ -116,13 +128,18 @@ class DesktopTests(unittest.TestCase):
             load_config(missing, {"restart_mode": "desktop-queue"})
         cfg = load_config(missing, {"restart_mode": "desktop-queue", "thread_id": TID})
         self.assertEqual(cfg.thread_id, TID)
+        cfg = load_config(missing, {"restart_mode": "desktop-queue", "thread_id": TID.upper()})
+        self.assertEqual(cfg.thread_id, TID)
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": TID}):
             args = build_parser().parse_args(["watch", "--desktop-thread"])
         self.assertEqual(args.desktop_thread, TID)
 
     def test_clear_preserves_delivery_marker(self):
         store = StateStore(self.home / "state.json")
-        store.save(State(desktop_attempted_turn_id=TURN))
+        store.save(State(desktop_attempted_turn_id=TURN, desktop_registered_thread_id=TID,
+                         desktop_baseline_turn_id=TURN))
         with mock.patch("codex_quota_watchdog.cli.paths", return_value={"state": store.path}):
             cmd_clear(None)
-        self.assertEqual(store.load().desktop_attempted_turn_id, TURN)
+        st = store.load()
+        self.assertEqual(st.desktop_attempted_turn_id, TURN)
+        self.assertEqual((st.desktop_registered_thread_id, st.desktop_baseline_turn_id), (TID, TURN))

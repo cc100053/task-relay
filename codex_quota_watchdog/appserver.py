@@ -28,6 +28,16 @@ class ProbeError(RuntimeError):
     """The quota could not be read. Callers must treat quota state as unknown."""
 
 
+class RpcError(ProbeError):
+    """The app-server answered a request with a JSON-RPC error."""
+
+    def __init__(self, code, message):
+        super().__init__(f"app-server error {code}: {message}")
+        self.code = code
+
+
+INVALID_REQUEST = -32600
+
 def find_codex(configured: str = "") -> str:
     if configured:
         return configured
@@ -172,7 +182,7 @@ class AppServerClient:
                     continue  # notifications and unrelated responses
                 if "error" in message:
                     err = message["error"] or {}
-                    raise ProbeError(f"app-server error {err.get('code')}: {err.get('message')}")
+                    raise RpcError(err.get("code"), err.get("message"))
                 result = message.get("result")
                 if not isinstance(result, dict):
                     raise ProbeError("app-server returned a non-object result")
@@ -184,9 +194,17 @@ class AppServerClient:
             }})
             wait_for(1)
             send({"method": "initialized"})
-            # Omit optional params: older CLIs accept only a unit request.
-            send({"id": 2, "method": "account/rateLimits/read"})
-            return wait_for(2)
+            # Background polls skip the reset-credit detail lookup; the count is still returned.
+            send({"id": 2, "method": "account/rateLimits/read",
+                  "params": {"excludeResetCreditDetails": True}})
+            try:
+                return wait_for(2)
+            except RpcError as exc:
+                if exc.code != INVALID_REQUEST:
+                    raise
+            # Older CLIs reject any params ("expected unit"): retry with a bare request.
+            send({"id": 3, "method": "account/rateLimits/read"})
+            return wait_for(3)
         finally:
             try:
                 proc.stdin.close()

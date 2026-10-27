@@ -72,13 +72,14 @@ headless replacement. Keep the desktop app running with the chat loaded so it ca
 consume the queued continuation.
 The queue command is documented in the [official CLI reference](https://learn.chatgpt.com/docs/developer-commands#codex-queue).
 
-Set these values in your config (use a CLI that supports `codex queue --help`):
+Set these values in your config (use a CLI whose `codex queue --help` lists `--thread` and `--message`):
 
 ```toml
 [watchdog]
 restart_mode = "desktop-queue"
 thread_id = "YOUR-EXACT-DESKTOP-THREAD-UUID"
 armed = false   # verify with doctor and dry-run first; true enables delivery
+# desktop_recover_existing_failure = false  # true: also recover a failure that existed at registration
 # macOS bundled CLI; adjust for your installation:
 codex_path = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 ```
@@ -92,7 +93,12 @@ before running a second foreground instance.
 `cqw doctor` verifies the queue command and registered chat; `cqw status` shows its
 latest turn and recovery state. Active turns, completed work, manual interruptions,
 authentication errors and generic HTTP 429 errors never trigger desktop recovery.
-If the chat advances before delivery, the pending recovery is cancelled. A delivery
+Only failures that happen after the chat is first registered are recovered; if its latest
+turn had already failed on quota at registration, that turn is ignored unless
+`desktop_recover_existing_failure = true` (the registration is remembered across restarts
+and `cqw clear`). A desktop database read error is logged and retried on the next poll;
+nothing is sent until a read succeeds. If the chat advances before delivery, the pending
+recovery is cancelled. A delivery
 attempt is saved before sending; failures or uncertain timeouts enter `needs_user`
 and are never automatically resent, even after a watchdog restart or `cqw clear`.
 Inspect the chat and queue before manually retrying a failed delivery.

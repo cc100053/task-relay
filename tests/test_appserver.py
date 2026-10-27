@@ -26,6 +26,10 @@ class AppServerTests(unittest.TestCase):
         result = self.client().read_rate_limits()
         self.assertEqual(result["rateLimits"]["primary"]["windowDurationMins"], 300)
 
+    def test_legacy_cli_retries_without_params(self):
+        result = self.client("legacy").read_rate_limits()
+        self.assertEqual(result["rateLimits"]["primary"]["windowDurationMins"], 300)
+
     def test_error_reply(self):
         with self.assertRaisesRegex(ProbeError, "boom"):
             self.client("error").read_rate_limits()
