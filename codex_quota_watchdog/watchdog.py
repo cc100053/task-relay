@@ -9,7 +9,7 @@ import logging
 import time
 from pathlib import Path
 
-from . import procs, quota, restart
+from . import desktop, procs, quota, restart
 from .appserver import ProbeError
 from .config import Config
 from .state import DONE, MONITORING, NEEDS_USER, WAITING_RESET, State, StateStore
@@ -69,6 +69,8 @@ class Watchdog:
     def run_forever(self, once: bool = False) -> None:
         mode = "DRY RUN (nothing will be stopped or started)" if self.dry_run else "ARMED"
         log.info("watchdog started: %s, phase=%s", mode, self.state.phase)
+        if self.cfg.restart_mode == "desktop-queue":
+            log.info("desktop recovery registered: thread=%s; process stopping disabled", self.cfg.thread_id)
         while True:
             delay = self.tick()
             if once:
@@ -87,6 +89,9 @@ class Watchdog:
 
         if snap is None:
             return self._unknown_delay()
+
+        if self.cfg.restart_mode == "desktop-queue":
+            return self._monitor_desktop(snap)
 
         reasons = quota.stop_reasons(snap, self.cfg)
         if not reasons:
@@ -117,6 +122,28 @@ class Watchdog:
         self._healthy_streak = 0
         log.info("stopped Codex; thread=%s; will re-check after %s",
                  thread_id or "none", quota.fmt_ts(self.state.resume_after))
+        return self._sleep_until_resume()
+
+    def _monitor_desktop(self, snap: quota.Snapshot) -> float:
+        try:
+            turn = desktop.latest_turn(self.cfg.thread_id)
+        except desktop.DesktopError as exc:
+            self._park(NEEDS_USER, str(exc))
+            return self.cfg.poll_seconds
+        if not turn.quota_limited or turn.turn_id == self.state.desktop_attempted_turn_id:
+            return self.cfg.poll_seconds
+        self.state.phase = WAITING_RESET
+        self.state.thread_id = turn.thread_id
+        self.state.desktop_turn_id = turn.turn_id
+        self.state.cwd = turn.cwd
+        self.state.stopped_at = self.clock()
+        self.state.account_id = snap.account_id
+        self.state.stop_reasons = ["desktop turn failed: usageLimitExceeded"]
+        self.state.resume_after = (quota.resume_after(snap, self.cfg) if quota.stop_reasons(snap, self.cfg)
+                                   else self.clock() + self.cfg.grace_seconds)
+        self._healthy_streak = 0
+        log.info("desktop quota failure registered: thread=%s turn=%s; waiting for quota recovery",
+                 turn.thread_id, turn.turn_id)
         return self._sleep_until_resume()
 
     def _targets(self) -> list:
@@ -203,6 +230,8 @@ class Watchdog:
         if self.state.restarts_last_day(now) >= self.cfg.max_restarts_per_day:
             self._park(NEEDS_USER, f"max_restarts_per_day ({self.cfg.max_restarts_per_day}) reached")
             return self.cfg.poll_seconds
+        if self.cfg.restart_mode == "desktop-queue":
+            return self._restart_desktop(now)
         try:
             args = restart.build_restart_args(self.codex, self.cfg, self.state.thread_id, self.state.cwd)
         except ValueError as exc:
@@ -218,6 +247,35 @@ class Watchdog:
                 return self.cfg.poll_seconds
             self.state.managed_pid = self.job.pid
         self.state.restart_history.append(now)
+        self._back_to_monitoring()
+        return self.cfg.poll_seconds
+
+    def _restart_desktop(self, now: float) -> float:
+        if self.state.thread_id != self.cfg.thread_id or not self.state.desktop_turn_id:
+            self._park(NEEDS_USER, "desktop recovery registration changed or no failed turn was recorded")
+            return self.cfg.poll_seconds
+        if self.state.desktop_attempted_turn_id == self.state.desktop_turn_id:
+            self._park(NEEDS_USER, "desktop delivery was already attempted; inspect the chat before retrying")
+            return self.cfg.poll_seconds
+        try:
+            turn = desktop.latest_turn(self.cfg.thread_id)
+            if turn.turn_id != self.state.desktop_turn_id or not turn.quota_limited:
+                log.info("desktop chat advanced or no longer has a quota failure; cancelling recovery")
+                self._back_to_monitoring()
+                return self.cfg.poll_seconds
+            # Persist before sending: a crash or ambiguous timeout must never duplicate delivery.
+            self.state.desktop_attempted_turn_id = turn.turn_id
+            self.state.restart_history.append(now)
+            self.store.save(self.state)
+            if self.dry_run:
+                log.warning("[dry-run] would queue desktop continuation: thread=%s turn=%s", turn.thread_id, turn.turn_id)
+            else:
+                desktop.queue_resume(self.codex, turn.thread_id, self.cfg.resume_prompt,
+                                     self.cfg.probe_timeout_seconds)
+                log.info("desktop continuation queued: thread=%s turn=%s", turn.thread_id, turn.turn_id)
+        except (desktop.DesktopError, ValueError) as exc:
+            self._park(NEEDS_USER, str(exc))
+            return self.cfg.poll_seconds
         self._back_to_monitoring()
         return self.cfg.poll_seconds
 
@@ -246,7 +304,7 @@ class Watchdog:
         if snap is None:
             return self._unknown_delay()
         reasons = quota.stop_reasons(snap, self.cfg)
-        if reasons:
+        if reasons and self.cfg.restart_mode != "desktop-queue":
             targets = self._targets()
             if targets:
                 log.warning("parked, but quota threshold reached (%s); stopping Codex", "; ".join(reasons))

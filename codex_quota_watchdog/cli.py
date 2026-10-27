@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, autostart, procs, quota
+from . import __version__, autostart, desktop, procs, quota
 from .appserver import AppServerClient, ProbeError, find_codex
 from .config import SAMPLE_CONFIG, ConfigError, data_dir, default_config_path, load_config
 from .restart import valid_thread_id
@@ -83,6 +83,13 @@ def cmd_status(args) -> int:
             print(f"  next restart check: {quota.fmt_ts(quota.resume_after(snap, cfg))}")
     else:
         print(f"Quota: UNKNOWN ({err}) - the watchdog would neither stop nor restart on this")
+    if cfg.restart_mode == "desktop-queue":
+        print(f"Desktop recovery: {'armed' if cfg.armed else 'dry run'}; thread {cfg.thread_id}")
+        try:
+            turn = desktop.latest_turn(cfg.thread_id)
+            print(f"  latest turn: {turn.turn_id or '(none)'}; status: {turn.status}; quota failure: {turn.quota_limited}")
+        except desktop.DesktopError as exc:
+            print(f"  desktop state unavailable: {exc}")
     for label, dry in (("state", False), ("dry-run state", True)):
         p = paths(dry)["state"]
         if not p.exists():
@@ -95,6 +102,8 @@ def cmd_status(args) -> int:
             print(f"  thread to resume: {st.thread_id}")
         if st.stop_reasons:
             print(f"  stopped because: {'; '.join(st.stop_reasons)}")
+        if st.desktop_attempted_turn_id:
+            print(f"  desktop delivery last attempted for turn: {st.desktop_attempted_turn_id}")
     return 0 if snap else 1
 
 
@@ -124,14 +133,21 @@ def cmd_doctor(args) -> int:
         print(f"[!!] app-server quota read failed: {err}")
         ok = False
     try:
-        targets = procs.find_targets(cfg)
-        print(f"[ok] Codex processes the watchdog would stop now: {len(targets)}")
-        for t in targets:
-            print(f"       pid {t.pid}: {t.cmdline[:120]}")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(f"[!!] process listing failed: {exc}")
+        if cfg.restart_mode == "desktop-queue":
+            desktop.check_queue(find_codex(cfg.codex_path), cfg.probe_timeout_seconds)
+            turn = desktop.latest_turn(cfg.thread_id)
+            print(f"[ok] desktop queue available; registered thread: {turn.thread_id}; latest turn: {turn.status}")
+            print("[ok] desktop recovery never stops processes")
+        else:
+            targets = procs.find_targets(cfg)
+            print(f"[ok] Codex processes the watchdog would stop now: {len(targets)}")
+            for t in targets:
+                print(f"       pid {t.pid}: {t.cmdline[:120]}")
+    except (ProbeError, desktop.DesktopError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"[!!] {'desktop recovery check' if cfg.restart_mode == 'desktop-queue' else 'process listing'} failed: {exc}")
         ok = False
-    print(f"[..] armed: {cfg.armed} ({'will stop/start processes' if cfg.armed else 'dry run unless --arm'})")
+    action = "will queue desktop continuations" if cfg.restart_mode == "desktop-queue" else "will stop/start processes"
+    print(f"[..] armed: {cfg.armed} ({action if cfg.armed else 'dry run unless --arm'})")
     print(f"[..] restart_mode: {cfg.restart_mode}")
     if cfg.restart_mode == "exec-resume" and cfg.thread_id and not valid_thread_id(cfg.thread_id):
         print("[!!] thread_id is not a valid UUID")
@@ -142,7 +158,13 @@ def cmd_doctor(args) -> int:
 
 
 def _watch(args, prompt: str | None = None) -> int:
-    cfg = _load(args, armed=True if args.arm else None)
+    desktop_thread = getattr(args, "desktop_thread", None)
+    cfg = _load(args, armed=True if args.arm else None,
+                restart_mode="desktop-queue" if desktop_thread is not None else None,
+                thread_id=desktop_thread)
+    if prompt is not None and cfg.restart_mode == "desktop-queue":
+        print("desktop-queue recovers an existing chat; use `cqw watch`, not `cqw run`", file=sys.stderr)
+        return 2
     dry_run = args.dry_run or not cfg.armed
     setup_logging(cfg, args.quiet)
     p = paths(dry_run)
@@ -151,7 +173,10 @@ def _watch(args, prompt: str | None = None) -> int:
             p["pid"].write_text(str(os.getpid()))
             try:
                 codex = find_codex(cfg.codex_path)
-            except ProbeError as exc:
+                if cfg.restart_mode == "desktop-queue":
+                    desktop.check_queue(codex, cfg.probe_timeout_seconds)
+                    desktop.latest_turn(cfg.thread_id)
+            except (ProbeError, desktop.DesktopError, ValueError) as exc:
                 log.error("%s", exc)
                 return 2
             client = AppServerClient(codex, cfg.app_server_args, cfg.probe_timeout_seconds)
@@ -191,7 +216,8 @@ def cmd_clear(args) -> int:
         store = StateStore(paths(dry)["state"])
         if store.path.exists():
             old = store.load()
-            store.save(State(phase=MONITORING, restart_history=old.restart_history))
+            store.save(State(phase=MONITORING, restart_history=old.restart_history,
+                             desktop_attempted_turn_id=old.desktop_attempted_turn_id))
     print("state reset to monitoring (a running watchdog picks this up after restarting it)")
     return 0
 
@@ -264,6 +290,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = sub.add_parser("watch", help="run the watchdog loop in the foreground")
     loop_flags(w)
+    w.add_argument("--desktop-thread", nargs="?", const=os.environ.get("CODEX_THREAD_ID", ""),
+                   help="recover this exact desktop chat; omit UUID to use CODEX_THREAD_ID")
     w.add_argument("--once", action="store_true", help="single decision step, then exit")
     w.set_defaults(func=cmd_watch)
 

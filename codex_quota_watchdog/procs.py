@@ -18,7 +18,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .appserver import CREATE_NO_WINDOW
 from .config import Config
@@ -27,7 +27,10 @@ log = logging.getLogger(__name__)
 
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 NATIVE_NAME_RE = re.compile(r"^codex(-(x86_64|aarch64)-.+)?$", re.I)
-DESKTOP_MARKERS = ("codex.app/", "/programs/openai/codex/", "/windowsapps/openai.codex")
+DESKTOP_MARKERS = (
+    "codex.app/", "chatgpt.app/", "codex computer use.app/",
+    "/programs/openai/codex/", "/windowsapps/openai.codex",
+)
 
 
 @dataclass(frozen=True)
@@ -80,7 +83,19 @@ def _list_posix() -> list[Proc]:
     )
     if out.returncode != 0:
         raise OSError(f"ps failed: {out.stderr.strip()[:200]}")
-    return parse_ps(out.stdout)
+    # args splits executable paths at spaces; comm preserves the executable name.
+    names = subprocess.run(
+        ["ps", "-A", "-o", "pid=,comm="],
+        capture_output=True, text=True, errors="replace", timeout=30,
+    )
+    if names.returncode != 0:
+        raise OSError(f"ps failed: {names.stderr.strip()[:200]}")
+    by_pid = {}
+    for line in names.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            by_pid[int(parts[0])] = os.path.basename(parts[1])
+    return [replace(p, name=by_pid[p.pid]) for p in parse_ps(out.stdout) if p.pid in by_pid]
 
 
 def parse_ps(text: str) -> list[Proc]:

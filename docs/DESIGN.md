@@ -55,6 +55,8 @@ into Codex (no hooks, no AGENTS.md edits, no proxy), so Codex upgrades can't bre
 
 ### Quota query & parsing
 * Spawn per probe (no long-lived connection to break), 30 s timeout, kill the whole process tree after.
+* Omit parameters for `initialized` and `account/rateLimits/read`: installed CLI 0.137.0
+  requires a unit quota request; the desktop CLI also accepts omitted optional parameters.
 * Prefer `rateLimitsByLimitId.codex`, fall back to `rateLimits`.
 * Window kind from `windowDurationMins` (300 = 5 h, 10080 = weekly), never from text.
 * Strict validation: numeric `usedPercent ≥ 0`, positive integer duration, `resetsAt` in seconds and
@@ -62,8 +64,11 @@ into Codex (no hooks, no AGENTS.md edits, no proxy), so Codex upgrades can't bre
 
 ### Process management
 * Enumerate with `Get-CimInstance Win32_Process` (Windows) / `ps -A -o pid,ppid,lstart,args` (POSIX).
+  Read POSIX executable names separately with `ps -A -o pid,comm` so spaces in paths
+  cannot turn a helper into a CLI match.
 * Categories: `cli` (native `codex`/`codex-<triple>`, `node … @openai/codex`), `desktop`
-  (path under `Codex.app` / `Programs\OpenAI\Codex`) — **off by default**, custom regexes.
+  (path under `Codex.app`, `ChatGPT.app`, `Codex Computer Use.app` or
+  `Programs\OpenAI\Codex`) — **off by default**, custom regexes.
 * Never touch itself, its ancestors (a shell inside Codex) or its own probe.
 * Stop roots politely (`taskkill /T` / SIGTERM), wait `terminate_timeout_seconds`, then force-kill
   only processes whose PID **and start time** still match (no PID-reuse kills).
@@ -84,6 +89,23 @@ into Codex (no hooks, no AGENTS.md edits, no proxy), so Codex upgrades can't bre
   (e.g. relaunch the desktop app or a script).
 * `none`: stop + wait only.
 * Restarted work runs headless with output in `jobs/*.log`, and is itself guarded.
+
+### Desktop-chat recovery
+* `restart_mode = "desktop-queue"` opts one exact configured `thread_id` into recovery.
+  `watch --desktop-thread [UUID]` can capture the executor's `CODEX_THREAD_ID`; it never
+  chooses the most recent chat or scans unrelated chats.
+* Read `threads` metadata from `state_5.sqlite` and the latest `thread_turns` entry from
+  `thread_history_1.sqlite`, both in SQLite read-only mode. Require a non-archived local
+  `Codex Desktop` originator and structured `failed` / `usageLimitExceeded` evidence.
+  Missing or incompatible schemas fail closed. Do not write Codex databases.
+* Desktop mode never calls process stopping or headless restart. Reuse reset waiting,
+  healthy confirmations, account-change protection and restart caps from the CLI loop.
+* Re-read the latest turn immediately before sending. If the user continued or completed
+  the chat, cancel recovery. Persist the attempted failed-turn UUID before calling
+  `codex queue --thread <UUID> --message <resume_prompt>`, so crashes and ambiguous delivery
+  failures cannot automatically send twice. `clear` preserves this delivery marker.
+* Keep the desktop app and target chat loaded to consume queued messages. A successful
+  queue command acknowledges enqueueing, not execution; never fall back to `exec resume`.
 
 ### Configuration
 TOML file (`cqw init-config`), every key optional, validated (unknown keys are errors).

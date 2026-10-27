@@ -183,10 +183,9 @@ class AppServerClient:
                 "clientInfo": {"name": "codex_quota_watchdog", "version": __version__},
             }})
             wait_for(1)
-            send({"method": "initialized", "params": {}})
-            # Background polls skip the reset-credit detail lookup; the count is still returned.
-            send({"id": 2, "method": "account/rateLimits/read",
-                  "params": {"excludeResetCreditDetails": True}})
+            send({"method": "initialized"})
+            # Omit optional params: older CLIs accept only a unit request.
+            send({"id": 2, "method": "account/rateLimits/read"})
             return wait_for(2)
         finally:
             try:

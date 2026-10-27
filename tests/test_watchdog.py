@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 from codex_quota_watchdog import procs as real_procs
-from codex_quota_watchdog import restart
+from codex_quota_watchdog import desktop, restart
 from codex_quota_watchdog.appserver import ProbeError
 from codex_quota_watchdog.config import Config
 from codex_quota_watchdog.state import MONITORING, NEEDS_USER, WAITING_RESET, StateStore
@@ -71,7 +71,7 @@ class FakeJob:
         return self.code
 
 
-class WatchdogTests(unittest.TestCase):
+class WatchdogTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = StateStore(Path(self.tmp.name, "state.json"))
@@ -96,6 +96,8 @@ class WatchdogTests(unittest.TestCase):
     def set_quota(self, **kw):
         self.client.reply = rate_limits(self.clock.now, **kw)
 
+
+class WatchdogTests(WatchdogTestCase):
     def test_healthy_quota_does_nothing(self):
         d = self.dog()
         self.set_quota(five_used=50)
@@ -277,6 +279,141 @@ class WatchdogTests(unittest.TestCase):
         self.set_quota(five_used=0)
         d.tick()
         self.assertEqual(self.launched, [])
+
+
+class DesktopWatchdogTests(WatchdogTestCase):
+    def setUp(self):
+        super().setUp()
+        self.cfg.restart_mode = "desktop-queue"
+        self.cfg.thread_id = TID
+        self.turn = desktop.DesktopTurn(TID, "0199a213-81c0-7800-8aa1-bbab2a035a54", "failed", True, "/work")
+        patcher = mock.patch.object(desktop, "latest_turn", return_value=self.turn)
+        self.latest = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(desktop, "queue_resume")
+        self.queue = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def ready(self, dog):
+        self.clock.now = dog.state.resume_after + 1
+        self.set_quota(five_used=0)
+        dog.tick()
+        self.clock.now += self.cfg.confirm_interval_seconds
+        dog.tick()
+
+    def test_desktop_wait_confirm_queue_once_survives_watchdog_restart(self):
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.assertEqual(d.state.phase, WAITING_RESET)
+        self.assertEqual(self.procs.stopped, [])
+        self.assertEqual(d.state.desktop_turn_id, self.turn.turn_id)
+        calls = self.client.calls
+        d.tick()
+        self.assertEqual(self.client.calls, calls)
+        self.queue.side_effect = lambda *args: self.assertEqual(
+            self.store.load().desktop_attempted_turn_id, self.turn.turn_id)
+        self.ready(d)
+        self.queue.assert_called_once_with("codex", TID, self.cfg.resume_prompt, self.cfg.probe_timeout_seconds)
+        self.assertEqual(self.launched, [])
+        self.assertEqual(d.state.phase, MONITORING)
+        self.dog().tick()
+        self.queue.assert_called_once()
+
+    def test_desktop_dry_run_never_queues_or_stops(self):
+        d = self.dog(dry_run=True)
+        self.set_quota(five_used=100)
+        d.tick()
+        self.ready(d)
+        self.queue.assert_not_called()
+        self.assertEqual(self.procs.stopped, [])
+
+    def test_desktop_other_errors_active_and_completed_turns_ignored(self):
+        for status in ("failed", "inProgress", "completed", "interrupted"):
+            self.latest.return_value = desktop.DesktopTurn(TID, self.turn.turn_id, status, False, "/work")
+            d = self.dog()
+            self.set_quota(five_used=100)
+            d.tick()
+            self.assertEqual(d.state.phase, MONITORING)
+        self.queue.assert_not_called()
+        self.assertEqual(self.procs.stopped, [])
+
+    def test_desktop_user_advanced_chat_cancels_recovery(self):
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.latest.return_value = desktop.DesktopTurn(TID, TID, "completed", False, "/work")
+        self.ready(d)
+        self.queue.assert_not_called()
+        self.assertEqual(d.state.phase, MONITORING)
+
+    def test_desktop_ambiguous_delivery_never_retried(self):
+        self.queue.side_effect = desktop.DesktopError("timeout: delivery uncertain")
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.ready(d)
+        self.assertEqual(d.state.phase, NEEDS_USER)
+        self.assertEqual(self.store.load().desktop_attempted_turn_id, self.turn.turn_id)
+        self.dog().tick()
+        self.queue.assert_called_once()
+        self.assertEqual(self.procs.stopped, [])
+
+    def test_desktop_missing_history_does_not_stop_or_queue(self):
+        self.latest.side_effect = desktop.DesktopError("history unavailable")
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.assertEqual(d.state.phase, NEEDS_USER)
+        self.assertEqual(self.procs.stopped, [])
+        self.queue.assert_not_called()
+
+    def test_desktop_new_registration_cannot_resume_old_thread(self):
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.cfg.thread_id = self.turn.turn_id
+        self.ready(d)
+        self.queue.assert_not_called()
+        self.assertEqual(d.state.phase, NEEDS_USER)
+
+    def test_desktop_healthy_quota_still_requires_grace_and_confirmations(self):
+        d = self.dog()
+        self.set_quota(five_used=0)
+        d.tick()
+        self.assertEqual(d.state.resume_after, self.clock.now + self.cfg.grace_seconds)
+        self.queue.assert_not_called()
+        self.ready(d)
+        self.queue.assert_called_once()
+
+    def test_desktop_unknown_quota_and_backend_null_never_queue(self):
+        d = self.dog()
+        self.set_quota(five_used=100)
+        d.tick()
+        self.clock.now = d.state.resume_after + 1
+        for reply in (ProbeError("offline"), rate_limits(self.clock.now, five_used=0, allowed=None)):
+            self.client.reply = reply
+            d.tick()
+            d.tick()
+        self.queue.assert_not_called()
+        self.assertEqual(d.state.phase, WAITING_RESET)
+        self.assertEqual(self.procs.stopped, [])
+
+    def test_desktop_account_change_and_restart_cap_block_delivery(self):
+        for capped in (False, True):
+            with self.subTest(capped=capped):
+                self.store.path.unlink(missing_ok=True)
+                d = self.dog()
+                self.set_quota(five_used=100, account="original")
+                d.tick()
+                self.clock.now = d.state.resume_after + 1
+                self.set_quota(five_used=0, account="original" if capped else "different")
+                if capped:
+                    d.state.restart_history = [self.clock.now] * self.cfg.max_restarts_per_day
+                d.tick()
+                d.tick()
+                self.assertEqual(d.state.phase, NEEDS_USER)
+        self.queue.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -62,6 +62,41 @@ It starts `codex exec --json …`, captures the thread UUID from the `thread.sta
 guards it: stop near the limit → wait for reset → `codex exec resume <UUID> "<resume prompt>"` →
 repeat until the job exits successfully.
 
+**C. Recover one desktop chat (`desktop-queue`)**
+
+This mode reads the registered local desktop chat's latest turn. Only a failed turn
+with structured `codexErrorInfo = "usageLimitExceeded"` is eligible. It waits for the
+official reset plus grace, confirms healthy quota, and sends one continuation through
+`codex queue --thread <UUID> --message ...`. It never stops processes or starts a
+headless replacement. Keep the desktop app running with the chat loaded so it can
+consume the queued continuation.
+The queue command is documented in the [official CLI reference](https://learn.chatgpt.com/docs/developer-commands#codex-queue).
+
+Set these values in your config (use a CLI that supports `codex queue --help`):
+
+```toml
+[watchdog]
+restart_mode = "desktop-queue"
+thread_id = "YOUR-EXACT-DESKTOP-THREAD-UUID"
+armed = false   # verify with doctor and dry-run first; true enables delivery
+# macOS bundled CLI; adjust for your installation:
+codex_path = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+```
+
+Inside a desktop chat's shell, `CODEX_THREAD_ID` is the exact chat UUID. A foreground
+watchdog can capture it with `cqw watch --desktop-thread` (or pass an explicit UUID).
+For background operation, save that UUID as `thread_id` in the config; the LaunchAgent
+does not inherit the current chat's environment. Stop the existing watchdog service
+before running a second foreground instance.
+
+`cqw doctor` verifies the queue command and registered chat; `cqw status` shows its
+latest turn and recovery state. Active turns, completed work, manual interruptions,
+authentication errors and generic HTTP 429 errors never trigger desktop recovery.
+If the chat advances before delivery, the pending recovery is cancelled. A delivery
+attempt is saved before sending; failures or uncertain timeouts enter `needs_user`
+and are never automatically resent, even after a watchdog restart or `cqw clear`.
+Inspect the chat and queue before manually retrying a failed delivery.
+
 ### Run in the background / at logon
 
 ```powershell
@@ -78,7 +113,7 @@ The autostarted watchdog runs `cqw watch --quiet` and respects `armed` in your c
 |---|---|
 | `cqw doctor` | Environment check, live quota read, list of processes that would be stopped, armed state |
 | `cqw status` | Live quota per window, verdict, next restart check, persisted watchdog state |
-| `cqw watch [--arm] [--dry-run] [--quiet] [--once]` | The watchdog loop |
+| `cqw watch [--arm] [--dry-run] [--quiet] [--once] [--desktop-thread [UUID]]` | The watchdog loop; desktop flag uses the supplied UUID or `CODEX_THREAD_ID` |
 | `cqw run [--arm] [--cd DIR] -- PROMPT` | Start a guarded headless `codex exec` job |
 | `cqw clear` | Leave `needs_user` after you have checked things, back to monitoring |
 | `cqw stop` | Stop a running watchdog |
@@ -112,7 +147,7 @@ stop_desktop = false             # desktop app — true closes your UI too
 extra_process_patterns = []      # extra regexes on the command line
 terminate_timeout_seconds = 20   # polite stop, then force-kill
 
-restart_mode = "exec-resume"     # exec-resume | command | none
+restart_mode = "exec-resume"     # exec-resume | command | none | desktop-queue
 exec_extra_args = []             # e.g. ["--sandbox", "workspace-write"] (check `codex exec --help`)
 resume_prompt = "The ChatGPT usage window has reset. Continue the previous task ..."
 thread_id = ""                   # fallback UUID to resume
@@ -157,7 +192,11 @@ on low quota but never restarts anything until you run `cqw clear`.
   `jobs/*.log`, not as a new TUI window. Open the thread in Codex afterwards to see it.
 * **Plain TUI sessions have no UUID on their command line**, so in guard mode the watchdog can stop and wait but
   can't resume them unless you set `thread_id`. Use `cqw run`, or start work with `codex resume <UUID>`.
-* **Desktop app:** stopping it is opt-in (`stop_desktop`), restarting it needs `restart_mode = "command"`.
+* **Desktop app:** `desktop-queue` recovers one registered local chat without closing the app.
+  It currently reads the desktop's `state_5.sqlite` and `thread_history_1.sqlite` read-only;
+  missing data or schema changes block recovery. Older chats without projected turn history
+  are unsupported. Queue acknowledgement confirms enqueueing, not completion of the resumed work.
+  Stopping the whole app remains opt-in (`stop_desktop`); relaunching it needs `restart_mode = "command"`.
   Process detection is by name/path heuristics — always check `cqw doctor` before arming.
 * **Windows consoles ignore polite stops**, so after `terminate_timeout_seconds` the CLI is force-killed.
 * **`ordinaryUsageAllowed`** and the app-server protocol are OpenAI's and may change; the watchdog treats any

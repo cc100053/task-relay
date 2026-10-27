@@ -7,6 +7,7 @@ import sys
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from uuid import UUID
 
 APP_NAME = "codex-quota-watchdog"
 
@@ -76,6 +77,7 @@ class Config:
     # --- Restart -------------------------------------------------------------
     # none        : stop + wait only, never start anything.
     # exec-resume : `codex exec resume <thread UUID> <prompt>` (exact UUID only, never --last).
+    # desktop-queue: recover the registered desktop chat through `codex queue`; never kill processes.
     # command     : run `restart_command` (a list of args, placeholders allowed).
     restart_mode: str = "exec-resume"
     resume_prompt: str = (
@@ -108,7 +110,7 @@ class ConfigError(ValueError):
     pass
 
 
-RESTART_MODES = ("none", "exec-resume", "command")
+RESTART_MODES = ("none", "exec-resume", "command", "desktop-queue")
 
 
 def load_config(path: Path | None = None, overrides: dict | None = None) -> Config:
@@ -156,6 +158,13 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"restart_mode must be one of {', '.join(RESTART_MODES)}")
     if cfg.restart_mode == "command" and not cfg.restart_command:
         raise ConfigError("restart_mode = 'command' needs restart_command")
+    if cfg.restart_mode == "desktop-queue":
+        try:
+            valid = str(UUID(cfg.thread_id)) == cfg.thread_id.lower()
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigError("desktop-queue needs an exact thread_id UUID")
     if cfg.poll_seconds < 15:
         raise ConfigError("poll_seconds must be at least 15")
     if cfg.confirm_reads < 1:
@@ -182,7 +191,7 @@ stop_cli = true              # codex CLI / TUI / exec processes
 stop_desktop = false         # the desktop app (closes your UI if true)
 terminate_timeout_seconds = 20
 
-# none | exec-resume | command
+# none | exec-resume | command | desktop-queue
 restart_mode = "exec-resume"
 # exec_extra_args = ["--sandbox", "workspace-write"]
 # thread_id = "00000000-0000-0000-0000-000000000000"

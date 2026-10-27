@@ -30,6 +30,9 @@ class State:
     last_summary: list[str] = field(default_factory=list)
     # Job started by `cqw run`; restarted only through its exact thread id.
     managed_pid: int | None = None
+    # Desktop failure selected for recovery, and the last delivery attempted (never auto-retry).
+    desktop_turn_id: str | None = None
+    desktop_attempted_turn_id: str | None = None
 
     def restarts_last_day(self, now: float) -> int:
         return sum(1 for t in self.restart_history if now - t < 86400)

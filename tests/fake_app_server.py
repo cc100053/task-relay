@@ -11,8 +11,14 @@ for line in sys.stdin:
         if mode == "exit":
             sys.exit(1)
         print(json.dumps({"id": msg["id"], "result": {"userAgent": "fake"}}), flush=True)
+    elif msg.get("method") == "initialized":
+        assert msg.get("params") is None
     elif msg.get("method") == "account/rateLimits/read":
-        assert msg["params"] == {"excludeResetCreditDetails": True}
+        if msg.get("params") is not None:
+            print(json.dumps({"id": msg["id"], "error": {
+                "code": -32600, "message": "Invalid request: invalid type: map, expected unit",
+            }}), flush=True)
+            continue
         if mode == "hang":
             continue
         print(json.dumps({"method": "account/rateLimits/updated", "params": {}}), flush=True)
