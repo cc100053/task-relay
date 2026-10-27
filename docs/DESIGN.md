@@ -107,6 +107,24 @@ into Codex (no hooks, no AGENTS.md edits, no proxy), so Codex upgrades can't bre
 * Keep the desktop app and target chat loaded to consume queued messages. A successful
   queue command acknowledges enqueueing, not execution; never fall back to `exec resume`.
 
+### TaskRelay recovery
+* `relay-queue` binds one absolute relay state path, with the schema defined in
+  [the skill's registration contract](../skills/task-relay/references/watchdog.md).
+  `register-relay` validates the local coordinator/queue and atomically updates only recovery
+  config settings. Reload the managed daemon once after binding; ownership handoffs update state only.
+* The relay owns its state. The watchdog reads `coordinator`, registered `workers`, `status`,
+  `quotaRecoveryId` and `resumeAtUTC`; it writes only its own recovery state. Missing or malformed
+  ownership and non-local participants fail closed. A second active relay cannot replace the binding.
+* A saved `WAITING_QUOTA` episode or a registered participant's structured quota failure triggers
+  recovery. After reset/grace and live confirmations, every reported window must have at least
+  `relay_min_remaining` (default 15%) remaining. Exactly 15% permits recovery.
+* Reread ownership immediately before queueing only the current coordinator. Defer for active or
+  interrupted turns; suppress delivery during handoff, input waits, pause and completion. The prompt
+  verifies ownership again on execution and asks the coordinator to reconcile workers before dispatch.
+* Persist request/failure identities before queueing, shared across coordinator succession and daemon
+  restarts; `clear` preserves them. A timeout parks recovery instead of automatically resending. This
+  provides at-most-once attempts, not guaranteed delivery. Desktop availability constraints still apply.
+
 ### Configuration
 TOML file (`cqw init-config`), every key optional, validated (unknown keys are errors).
 Key knobs: `armed`, thresholds per window, `grace_seconds`, `confirm_reads`, `poll_seconds`,

@@ -9,7 +9,7 @@ import logging
 import time
 from pathlib import Path
 
-from . import desktop, procs, quota, restart
+from . import desktop, procs, quota, relay, restart
 from .appserver import ProbeError
 from .config import Config
 from .state import DONE, MONITORING, NEEDS_USER, WAITING_RESET, State, StateStore
@@ -56,6 +56,17 @@ class Watchdog:
     # ------------------------------------------------------------------- loop
     def tick(self) -> float:
         """Run one decision step; return seconds to sleep before the next."""
+        if self.cfg.restart_mode == "relay-queue" and self.state.phase != NEEDS_USER:
+            try:
+                current = relay.read(self.cfg.relay_state_path)
+                self.state.relay_state_path = str(current.path)
+                self.state.thread_id = current.coordinator
+                if current.status in {"DONE", "PAUSED", "NEEDS_INPUT", "HANDOFF_PENDING"}:
+                    self._back_to_monitoring()
+                    self.store.save(self.state)
+                    return self.cfg.poll_seconds
+            except desktop.DesktopError as exc:
+                self._park(NEEDS_USER, str(exc))
         phase = self.state.phase
         if phase == WAITING_RESET:
             delay = self._tick_waiting()
@@ -71,6 +82,8 @@ class Watchdog:
         log.info("watchdog started: %s, phase=%s", mode, self.state.phase)
         if self.cfg.restart_mode == "desktop-queue":
             log.info("desktop recovery registered: thread=%s; process stopping disabled", self.cfg.thread_id)
+        elif self.cfg.restart_mode == "relay-queue":
+            log.info("TaskRelay recovery registered: state=%s; process stopping disabled", self.cfg.relay_state_path)
         while True:
             delay = self.tick()
             if once:
@@ -92,6 +105,8 @@ class Watchdog:
 
         if self.cfg.restart_mode == "desktop-queue":
             return self._monitor_desktop(snap)
+        if self.cfg.restart_mode == "relay-queue":
+            return self._monitor_relay(snap)
 
         reasons = quota.stop_reasons(snap, self.cfg)
         if not reasons:
@@ -154,6 +169,29 @@ class Watchdog:
             targets += [p for p in all_procs if p.pid == self.job.pid]
         return targets
 
+    def _monitor_relay(self, snap: quota.Snapshot) -> float:
+        try:
+            current = relay.read(self.cfg.relay_state_path)
+            if not current.pending(self.state.relay_attempted_recoveries):
+                return self.cfg.poll_seconds
+            turn = desktop.latest_turn(current.coordinator)
+            if not relay.can_wake(turn):
+                return self.cfg.poll_seconds
+        except desktop.DesktopError as exc:
+            self._park(NEEDS_USER, str(exc))
+            return self.cfg.poll_seconds
+        self.state.phase = WAITING_RESET
+        self.state.thread_id = current.coordinator
+        self.state.account_id = snap.account_id
+        self.state.cwd = turn.cwd
+        self.state.stop_reasons = ["TaskRelay quota recovery pending"]
+        self.state.resume_after = (quota.resume_after(snap, self.cfg) if quota.stop_reasons(snap, self.cfg)
+                                   else self.clock() + self.cfg.grace_seconds)
+        if current.resume_at is not None:
+            self.state.resume_after = max(self.state.resume_after or current.resume_at, current.resume_at)
+        self._healthy_streak = 0
+        return self._sleep_until_resume()
+
     def _job_exited(self, code: int, snap: quota.Snapshot | None) -> float:
         job, self.job = self.job, None
         log.info("managed job exited with code %s (log: %s)", code, job.log_path)
@@ -193,6 +231,17 @@ class Watchdog:
 
     def _tick_waiting(self) -> float:
         now = self.clock()
+        if self.cfg.restart_mode == "relay-queue":
+            try:
+                current = relay.read(self.cfg.relay_state_path)
+                if not current.pending(self.state.relay_attempted_recoveries):
+                    self._back_to_monitoring()
+                    return self.cfg.poll_seconds
+            except desktop.DesktopError as exc:
+                self._park(NEEDS_USER, str(exc))
+                return self.cfg.poll_seconds
+            if current.resume_at is not None:
+                self.state.resume_after = max(self.state.resume_after or current.resume_at, current.resume_at)
         if self.state.resume_after and now < self.state.resume_after:
             return self.state.resume_after - now  # no need to poll before the official reset
 
@@ -232,6 +281,8 @@ class Watchdog:
             return self.cfg.poll_seconds
         if self.cfg.restart_mode == "desktop-queue":
             return self._restart_desktop(now)
+        if self.cfg.restart_mode == "relay-queue":
+            return self._restart_relay(now)
         try:
             args = restart.build_restart_args(self.codex, self.cfg, self.state.thread_id, self.state.cwd)
         except ValueError as exc:
@@ -285,6 +336,37 @@ class Watchdog:
         self.state.stop_reasons = []
         self.state.note = ""
 
+    def _restart_relay(self, now: float) -> float:
+        try:
+            current = relay.read(self.cfg.relay_state_path)
+            if current.resume_at is not None and now < current.resume_at:
+                self.state.resume_after = current.resume_at
+                return self._sleep_until_resume()
+            pending = current.pending(self.state.relay_attempted_recoveries)
+            if not pending:
+                self._back_to_monitoring()
+                return self.cfg.poll_seconds
+            turn = desktop.latest_turn(current.coordinator)
+            if not relay.can_wake(turn):
+                return self.cfg.poll_seconds
+            # Catch ownership changes; the queued prompt verifies ownership again on execution.
+            if relay.read(self.cfg.relay_state_path) != current:
+                return self.cfg.poll_seconds
+            self.state.thread_id = current.coordinator
+            self.state.relay_attempted_recoveries.extend(pending)
+            self.state.restart_history.append(now)
+            self.store.save(self.state)
+            if self.dry_run:
+                log.warning("[dry-run] would queue TaskRelay coordinator: %s", current.coordinator)
+            else:
+                desktop.queue_resume(self.codex, current.coordinator, current.prompt(), self.cfg.probe_timeout_seconds)
+                log.info("TaskRelay recovery queued: coordinator=%s state=%s", current.coordinator, current.path)
+        except (desktop.DesktopError, ValueError) as exc:
+            self._park(NEEDS_USER, str(exc))
+            return self.cfg.poll_seconds
+        self._back_to_monitoring()
+        return self.cfg.poll_seconds
+
     # ----------------------------------------------------------------- parked
     def _park(self, phase: str, note: str) -> None:
         self.state.phase = phase
@@ -304,7 +386,7 @@ class Watchdog:
         if snap is None:
             return self._unknown_delay()
         reasons = quota.stop_reasons(snap, self.cfg)
-        if reasons and self.cfg.restart_mode != "desktop-queue":
+        if reasons and self.cfg.restart_mode not in {"desktop-queue", "relay-queue"}:
             targets = self._targets()
             if targets:
                 log.warning("parked, but quota threshold reached (%s); stopping Codex", "; ".join(reasons))

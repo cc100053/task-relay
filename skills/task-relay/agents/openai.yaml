@@ -1,0 +1,3 @@
+interface:
+  display_name: "Task Relay"
+  short_description: "Resume delegated tasks with compact checkpoints"

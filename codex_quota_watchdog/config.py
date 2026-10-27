@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -78,6 +81,7 @@ class Config:
     # none        : stop + wait only, never start anything.
     # exec-resume : `codex exec resume <thread UUID> <prompt>` (exact UUID only, never --last).
     # desktop-queue: recover the registered desktop chat through `codex queue`; never kill processes.
+    # relay-queue : recover the current coordinator from TaskRelay state, including worker failures.
     # command     : run `restart_command` (a list of args, placeholders allowed).
     restart_mode: str = "exec-resume"
     resume_prompt: str = (
@@ -91,6 +95,9 @@ class Config:
     restart_cwd: str = ""
     # Thread to resume when none was captured automatically.
     thread_id: str = ""
+    # relay-queue reads the active coordinator from this durable TaskRelay state.
+    relay_state_path: str = ""
+    relay_min_remaining: float = 15.0
     # Safety valve against restart loops.
     max_restarts_per_day: int = 6
 
@@ -100,6 +107,8 @@ class Config:
     log_backups: int = 5
 
     def threshold_for(self, kind: str) -> float:
+        if self.restart_mode == "relay-queue":
+            return self.relay_min_remaining
         return {
             "5h": self.five_hour_min_remaining,
             "weekly": self.weekly_min_remaining,
@@ -110,7 +119,7 @@ class ConfigError(ValueError):
     pass
 
 
-RESTART_MODES = ("none", "exec-resume", "command", "desktop-queue")
+RESTART_MODES = ("none", "exec-resume", "command", "desktop-queue", "relay-queue")
 
 
 def load_config(path: Path | None = None, overrides: dict | None = None) -> Config:
@@ -150,7 +159,7 @@ def _apply(cfg: Config, raw: dict, source: str) -> None:
 
 
 def validate(cfg: Config) -> None:
-    for name in ("five_hour_min_remaining", "weekly_min_remaining", "other_min_remaining"):
+    for name in ("five_hour_min_remaining", "weekly_min_remaining", "other_min_remaining", "relay_min_remaining"):
         value = getattr(cfg, name)
         if not 0 <= value < 100:
             raise ConfigError(f"{name} must be between 0 and 100 (got {value})")
@@ -165,12 +174,58 @@ def validate(cfg: Config) -> None:
             valid = False
         if not valid:
             raise ConfigError("desktop-queue needs an exact thread_id UUID")
+    if cfg.restart_mode == "relay-queue" and not Path(cfg.relay_state_path).is_absolute():
+        raise ConfigError("relay-queue needs an absolute relay_state_path")
     if cfg.poll_seconds < 15:
         raise ConfigError("poll_seconds must be at least 15")
     if cfg.confirm_reads < 1:
         raise ConfigError("confirm_reads must be at least 1")
     if not cfg.app_server_args:
         raise ConfigError("app_server_args must not be empty")
+
+
+def register_relay(path: Path, state_path: Path, arm: bool = False) -> None:
+    """Update only recovery settings, preserving other TOML settings and comments."""
+    source = path.read_text(encoding="utf-8") if path.exists() else SAMPLE_CONFIG
+    raw = tomllib.loads(source)
+    updates = {"restart_mode": "relay-queue", "relay_state_path": str(state_path)}
+    if arm:
+        updates["armed"] = True
+    expected = Config()
+    _apply(expected, raw.get("watchdog", raw), source=str(path))
+    _apply(expected, updates, source="TaskRelay registration")
+    validate(expected)
+    pending = updates.copy()
+    section = "" if "watchdog" not in raw else "watchdog"
+    current = ""
+    lines = []
+    inserted = False
+    for line in source.splitlines(keepends=True):
+        header = re.match(r"\s*\[([^\]]+)\]\s*(?:#.*)?$", line)
+        if header:
+            if current == section and not inserted:
+                lines.extend(f"{key} = {json.dumps(value)}\n" for key, value in pending.items())
+                inserted = True
+            current = header[1].strip()
+        match = re.match(r"\s*(\w+)\s*=", line)
+        if current == section and match and match[1] in updates:
+            key = match[1]
+            lines.append(f"{key} = {json.dumps(updates[key])}\n")
+            pending.pop(key, None)
+            continue
+        lines.append(line if line.endswith("\n") else line + "\n")
+    if not inserted:
+        lines.extend(f"{key} = {json.dumps(value)}\n" for key, value in pending.items())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as fh:
+        temporary = Path(fh.name)
+        fh.write("".join(lines))
+    try:
+        if load_config(temporary) != expected:
+            raise ConfigError("cannot safely update this TOML layout; recovery settings were not changed")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 SAMPLE_CONFIG = """\
@@ -191,8 +246,10 @@ stop_cli = true              # codex CLI / TUI / exec processes
 stop_desktop = false         # the desktop app (closes your UI if true)
 terminate_timeout_seconds = 20
 
-# none | exec-resume | command | desktop-queue
+# none | exec-resume | command | desktop-queue | relay-queue
 restart_mode = "exec-resume"
+# relay_state_path = "/absolute/project/.task-relay/state.json"
+# relay_min_remaining = 15.0  # relay-queue pauses strictly below this percentage
 # exec_extra_args = ["--sandbox", "workspace-write"]
 # thread_id = "00000000-0000-0000-0000-000000000000"
 # restart_cwd = "C:\\\\work\\\\repo"

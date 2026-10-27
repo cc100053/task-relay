@@ -114,6 +114,8 @@ def parse_snapshot(result: dict, now: float) -> Snapshot:
 
 
 def blocking_windows(snap: Snapshot, cfg: Config) -> list[Window]:
+    if cfg.restart_mode == "relay-queue":
+        return [w for w in snap.windows if w.remaining < cfg.threshold_for(w.kind)]
     return [w for w in snap.windows if w.remaining <= cfg.threshold_for(w.kind)]
 
 
@@ -125,8 +127,9 @@ def stop_reasons(snap: Snapshot, cfg: Config) -> list[str]:
     if snap.reached_type:
         reasons.append(f"rate limit reached ({snap.reached_type})")
     for w in blocking_windows(snap, cfg):
+        operator = "<" if cfg.restart_mode == "relay-queue" else "<="
         reasons.append(
-            f"{w.kind} window: {w.remaining:.1f}% left <= threshold {cfg.threshold_for(w.kind):g}%"
+            f"{w.kind} window: {w.remaining:.1f}% left {operator} threshold {cfg.threshold_for(w.kind):g}%"
         )
     return reasons
 
@@ -157,7 +160,7 @@ def restart_blockers(snap: Snapshot, cfg: Config, now: float) -> list[str]:
     if snap.reached_type:
         problems.append(f"rate limit still reached ({snap.reached_type})")
     for w in snap.windows:
-        if w.remaining <= cfg.threshold_for(w.kind):
+        if w in blocking_windows(snap, cfg):
             problems.append(f"{w.kind} window still at {w.remaining:.1f}% left")
         if w.resets_at is not None and w.resets_at <= now:
             problems.append(f"{w.kind} window data is stale (resetsAt already passed)")

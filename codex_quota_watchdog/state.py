@@ -33,6 +33,8 @@ class State:
     # Desktop failure selected for recovery, and the last delivery attempted (never auto-retry).
     desktop_turn_id: str | None = None
     desktop_attempted_turn_id: str | None = None
+    relay_attempted_recoveries: list[str] = field(default_factory=list)
+    relay_state_path: str | None = None
 
     def restarts_last_day(self, now: float) -> int:
         return sum(1 for t in self.restart_history if now - t < 86400)

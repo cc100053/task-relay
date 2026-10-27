@@ -13,9 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, autostart, desktop, procs, quota
+from . import __version__, autostart, desktop, procs, quota, relay
 from .appserver import AppServerClient, ProbeError, find_codex
-from .config import SAMPLE_CONFIG, ConfigError, data_dir, default_config_path, load_config
+from .config import SAMPLE_CONFIG, ConfigError, data_dir, default_config_path, load_config, register_relay
 from .restart import valid_thread_id
 from .state import MONITORING, AlreadyRunning, InstanceLock, State, StateStore
 from .watchdog import Watchdog
@@ -90,6 +90,14 @@ def cmd_status(args) -> int:
             print(f"  latest turn: {turn.turn_id or '(none)'}; status: {turn.status}; quota failure: {turn.quota_limited}")
         except desktop.DesktopError as exc:
             print(f"  desktop state unavailable: {exc}")
+    if cfg.restart_mode == "relay-queue":
+        try:
+            current = relay.read(cfg.relay_state_path)
+            print(f"TaskRelay recovery (relay-queue): {'armed' if cfg.armed else 'dry run'}; state {current.path}")
+            print(f"  active coordinator: {current.coordinator}; relay status: {current.status}")
+            print(f"  registered workers: {len(current.workers)}")
+        except desktop.DesktopError as exc:
+            print(f"  TaskRelay state unavailable: {exc}")
     for label, dry in (("state", False), ("dry-run state", True)):
         p = paths(dry)["state"]
         if not p.exists():
@@ -100,6 +108,9 @@ def cmd_status(args) -> int:
             print(f"  waiting until: {quota.fmt_ts(st.resume_after)}")
         if st.thread_id:
             print(f"  thread to resume: {st.thread_id}")
+        if st.relay_state_path:
+            print(f"  relay state observed by watchdog: {st.relay_state_path}")
+            print(f"  last live quota check: {quota.fmt_ts(st.last_check_at)}")
         if st.stop_reasons:
             print(f"  stopped because: {'; '.join(st.stop_reasons)}")
         if st.desktop_attempted_turn_id:
@@ -133,9 +144,11 @@ def cmd_doctor(args) -> int:
         print(f"[!!] app-server quota read failed: {err}")
         ok = False
     try:
-        if cfg.restart_mode == "desktop-queue":
+        if cfg.restart_mode in {"desktop-queue", "relay-queue"}:
             desktop.check_queue(find_codex(cfg.codex_path), cfg.probe_timeout_seconds)
-            turn = desktop.latest_turn(cfg.thread_id)
+            thread_id = (relay.read(cfg.relay_state_path).coordinator
+                         if cfg.restart_mode == "relay-queue" else cfg.thread_id)
+            turn = desktop.latest_turn(thread_id)
             print(f"[ok] desktop queue available; registered thread: {turn.thread_id}; latest turn: {turn.status}")
             print("[ok] desktop recovery never stops processes")
         else:
@@ -144,9 +157,10 @@ def cmd_doctor(args) -> int:
             for t in targets:
                 print(f"       pid {t.pid}: {t.cmdline[:120]}")
     except (ProbeError, desktop.DesktopError, OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(f"[!!] {'desktop recovery check' if cfg.restart_mode == 'desktop-queue' else 'process listing'} failed: {exc}")
+        print(f"[!!] recovery/process check failed: {exc}")
         ok = False
-    action = "will queue desktop continuations" if cfg.restart_mode == "desktop-queue" else "will stop/start processes"
+    action = ("will queue desktop continuations" if cfg.restart_mode in {"desktop-queue", "relay-queue"}
+              else "will stop/start processes")
     print(f"[..] armed: {cfg.armed} ({action if cfg.armed else 'dry run unless --arm'})")
     print(f"[..] restart_mode: {cfg.restart_mode}")
     if cfg.restart_mode == "exec-resume" and cfg.thread_id and not valid_thread_id(cfg.thread_id):
@@ -159,11 +173,12 @@ def cmd_doctor(args) -> int:
 
 def _watch(args, prompt: str | None = None) -> int:
     desktop_thread = getattr(args, "desktop_thread", None)
+    relay_state = getattr(args, "relay_state", None)
     cfg = _load(args, armed=True if args.arm else None,
-                restart_mode="desktop-queue" if desktop_thread is not None else None,
-                thread_id=desktop_thread)
-    if prompt is not None and cfg.restart_mode == "desktop-queue":
-        print("desktop-queue recovers an existing chat; use `cqw watch`, not `cqw run`", file=sys.stderr)
+                restart_mode=("relay-queue" if relay_state else "desktop-queue" if desktop_thread is not None else None),
+                thread_id=desktop_thread, relay_state_path=str(Path(relay_state).resolve()) if relay_state else None)
+    if prompt is not None and cfg.restart_mode in {"desktop-queue", "relay-queue"}:
+        print("queue recovery uses existing chats; use `cqw watch`, not `cqw run`", file=sys.stderr)
         return 2
     dry_run = args.dry_run or not cfg.armed
     setup_logging(cfg, args.quiet)
@@ -173,9 +188,11 @@ def _watch(args, prompt: str | None = None) -> int:
             p["pid"].write_text(str(os.getpid()))
             try:
                 codex = find_codex(cfg.codex_path)
-                if cfg.restart_mode == "desktop-queue":
+                if cfg.restart_mode in {"desktop-queue", "relay-queue"}:
                     desktop.check_queue(codex, cfg.probe_timeout_seconds)
-                    desktop.latest_turn(cfg.thread_id)
+                    thread_id = (relay.read(cfg.relay_state_path).coordinator
+                                 if cfg.restart_mode == "relay-queue" else cfg.thread_id)
+                    desktop.latest_turn(thread_id)
             except (ProbeError, desktop.DesktopError, ValueError) as exc:
                 log.error("%s", exc)
                 return 2
@@ -217,7 +234,8 @@ def cmd_clear(args) -> int:
         if store.path.exists():
             old = store.load()
             store.save(State(phase=MONITORING, restart_history=old.restart_history,
-                             desktop_attempted_turn_id=old.desktop_attempted_turn_id))
+                             desktop_attempted_turn_id=old.desktop_attempted_turn_id,
+                             relay_attempted_recoveries=old.relay_attempted_recoveries))
     print("state reset to monitoring (a running watchdog picks this up after restarting it)")
     return 0
 
@@ -264,6 +282,27 @@ def cmd_autostart(args) -> int:
     return 0
 
 
+def cmd_register_relay(args) -> int:
+    cfg = _load(args)
+    try:
+        current = relay.read(args.state)
+        if cfg.restart_mode == "relay-queue" and Path(cfg.relay_state_path).resolve() != current.path:
+            previous = relay.read(cfg.relay_state_path)
+            if previous.status not in {"DONE", "PAUSED"}:
+                raise desktop.DesktopError("another active relay is registered; finish or pause it before rebinding")
+        turn = desktop.latest_turn(current.coordinator)
+        desktop.check_queue(find_codex(cfg.codex_path), cfg.probe_timeout_seconds)
+        path = Path(args.config) if args.config else default_config_path()
+        register_relay(path, current.path, args.arm)
+    except (ConfigError, desktop.DesktopError, ProbeError, OSError, ValueError) as exc:
+        print(f"TaskRelay registration failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"Registered TaskRelay state: {current.path}")
+    print(f"Active coordinator: {turn.thread_id}; config: {path}")
+    print("Reload with `cqw autostart install` once; coordinator handoffs then follow the state automatically.")
+    return 0
+
+
 def cmd_logs(args) -> int:
     path = paths()["log"]
     if not path.exists():
@@ -290,10 +329,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = sub.add_parser("watch", help="run the watchdog loop in the foreground")
     loop_flags(w)
-    w.add_argument("--desktop-thread", nargs="?", const=os.environ.get("CODEX_THREAD_ID", ""),
+    target = w.add_mutually_exclusive_group()
+    target.add_argument("--desktop-thread", nargs="?", const=os.environ.get("CODEX_THREAD_ID", ""),
                    help="recover this exact desktop chat; omit UUID to use CODEX_THREAD_ID")
+    target.add_argument("--relay-state", help="follow the active coordinator in this TaskRelay state file")
     w.add_argument("--once", action="store_true", help="single decision step, then exit")
     w.set_defaults(func=cmd_watch)
+
+    registration = sub.add_parser("register-relay", help="bind recovery config to a durable TaskRelay state")
+    registration.add_argument("--state", required=True, help="TaskRelay state JSON path")
+    registration.add_argument("--arm", action="store_true", help="enable recovery delivery")
+    registration.set_defaults(func=cmd_register_relay)
 
     r = sub.add_parser("run", help="start a headless `codex exec` job and guard it")
     loop_flags(r)

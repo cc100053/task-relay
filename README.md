@@ -46,7 +46,7 @@ cqw watch --arm        # really stop / wait / resume
 
 Start in dry-run, check `cqw logs` after a limit event, then arm it (`armed = true` in config, or `--arm`).
 
-### Two ways to use it
+### Ways to use it
 
 **A. Guard whatever Codex you run (`cqw watch`)**
 Use Codex as usual (TUI, `codex exec`, IDE). When quota runs low, the watchdog stops the Codex CLI
@@ -97,6 +97,53 @@ attempt is saved before sending; failures or uncertain timeouts enter `needs_use
 and are never automatically resent, even after a watchdog restart or `cqw clear`.
 Inspect the chat and queue before manually retrying a failed delivery.
 
+**D. Follow TaskRelay coordinator handoffs (`relay-queue`)**
+
+Use the [TaskRelay skill](skills/task-relay/SKILL.md) and its
+[watchdog registration contract](skills/task-relay/references/watchdog.md). The coordinator
+records its exact local UUID and active worker UUIDs in the relay's existing durable state:
+
+```json
+{
+  "coordinator": {"threadId": "COORDINATOR-UUID", "hostId": "local"},
+  "workers": [{"threadId": "WORKER-UUID", "hostId": "local"}],
+  "status": "RUNNING",
+  "quotaRecoveryId": null,
+  "resumeAtUTC": null
+}
+```
+
+```sh
+cqw register-relay --state /absolute/project/.task-relay/state.json --arm
+cqw autostart install   # reload the managed daemon once with the new binding
+cqw status
+# Alternatively, foreground dry-run (stop the background service first):
+cqw watch --relay-state /absolute/project/.task-relay/state.json --dry-run
+```
+
+The daemon rereads the state on every poll and immediately before delivery. When a coordinator
+hands off, atomically update `coordinator` in the same file; no daemon restart or fixed UUID
+config update is needed. One installation follows one relay; registration refuses to replace a
+different active relay. A missing, malformed or remote registration parks recovery safely.
+
+A structured quota failure in **any registered participant** wakes only the **current coordinator**
+after live quota recovers. A coordinator can request recovery before exhaustion by atomically
+saving `WAITING_QUOTA`, a new `quotaRecoveryId` UUID for that waiting episode, and `resumeAtUTC`
+(ISO 8601 UTC, or null when unknown). Keep that request ID through handoffs and ordinary updates.
+The default recovery threshold is **at least 15% remaining in every reported window**
+(`relay_min_remaining`); the saved resume time, grace period and healthy-read confirmations also apply.
+
+`HANDOFF_PENDING`, `NEEDS_INPUT`, `PAUSED` and `DONE` suppress recovery. Active or manually
+interrupted coordinator turns defer delivery. Attempts are persisted before sending and survive
+daemon restarts and `cqw clear`; ambiguous delivery is never automatically resent. The prompt
+requires the coordinator to verify ownership and reconcile workers/checkpoints before dispatch.
+The daemon never writes the relay state, stops Codex, or resumes workers directly.
+
+Keep the desktop app running and the current coordinator chat loaded. Enqueueing does not prove
+execution. The skill binds the service during an authorized relay execution; installing or editing
+the skill alone does not start work. Install the `skills/task-relay` folder into your Codex skills
+directory to use the updated workflow.
+
 ### Run in the background / at logon
 
 ```powershell
@@ -113,7 +160,8 @@ The autostarted watchdog runs `cqw watch --quiet` and respects `armed` in your c
 |---|---|
 | `cqw doctor` | Environment check, live quota read, list of processes that would be stopped, armed state |
 | `cqw status` | Live quota per window, verdict, next restart check, persisted watchdog state |
-| `cqw watch [--arm] [--dry-run] [--quiet] [--once] [--desktop-thread [UUID]]` | The watchdog loop; desktop flag uses the supplied UUID or `CODEX_THREAD_ID` |
+| `cqw watch [--arm] [--dry-run] [--quiet] [--once] [--desktop-thread [UUID] \| --relay-state PATH]` | The watchdog loop; select one desktop chat or a dynamic TaskRelay coordinator |
+| `cqw register-relay --state PATH [--arm]` | Validate and persist a TaskRelay binding; reload the managed service once afterwards |
 | `cqw run [--arm] [--cd DIR] -- PROMPT` | Start a guarded headless `codex exec` job |
 | `cqw clear` | Leave `needs_user` after you have checked things, back to monitoring |
 | `cqw stop` | Stop a running watchdog |
@@ -147,7 +195,9 @@ stop_desktop = false             # desktop app — true closes your UI too
 extra_process_patterns = []      # extra regexes on the command line
 terminate_timeout_seconds = 20   # polite stop, then force-kill
 
-restart_mode = "exec-resume"     # exec-resume | command | none | desktop-queue
+restart_mode = "exec-resume"     # exec-resume | command | none | desktop-queue | relay-queue
+relay_state_path = ""            # absolute durable TaskRelay JSON path for relay-queue
+relay_min_remaining = 15.0        # relay-queue: recover at >= this remaining percentage
 exec_extra_args = []             # e.g. ["--sandbox", "workspace-write"] (check `codex exec --help`)
 resume_prompt = "The ChatGPT usage window has reset. Continue the previous task ..."
 thread_id = ""                   # fallback UUID to resume
