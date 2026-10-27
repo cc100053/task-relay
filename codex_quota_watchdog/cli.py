@@ -278,7 +278,11 @@ def cmd_autostart(args) -> int:
         print(autostart.uninstall())
         return 0
     extra = ["--config", os.path.abspath(args.config)] if args.config else []
-    print(autostart.install(extra))
+    try:
+        print(autostart.install(extra))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"autostart installation failed: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+from . import procs
+from .config import data_dir
+from .state import AlreadyRunning, InstanceLock
 
 LABEL = "com.codex-quota-watchdog"
 PKG_PARENT = str(Path(__file__).resolve().parent.parent)
@@ -34,10 +40,40 @@ def target_path() -> Path:
     return Path.home() / ".config" / "systemd" / "user" / "codex-quota-watchdog.service"
 
 
+def _stop_windows_watchdog() -> None:
+    base = data_dir()
+    lock = base / "watchdog.lock"
+    try:
+        with InstanceLock(lock):
+            return
+    except AlreadyRunning:
+        pass
+    pid = int((base / "watchdog.pid").read_text().strip())
+    target = next((p for p in procs.list_processes() if p.pid == pid and p.pid > 1
+                   and p.name.lower() in {"python.exe", "pythonw.exe"}
+                   and re.search(r'(?:^|\s)"?-m"?\s+"?codex_quota_watchdog"?\s', p.cmdline)
+                   and re.search(r'(?:^|\s)"?watch"?\s+"?--quiet"?(?:\s|$)', p.cmdline)), None)
+    if target is None:
+        raise RuntimeError("cannot identify the managed watchdog; inspect it and use `cqw stop` first")
+    # Stop only this process; its Codex jobs must survive a service reload.
+    if procs._alive({target.key: target}):
+        procs._force(target)
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with InstanceLock(lock):
+                return
+        except AlreadyRunning:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("watchdog did not stop; replacement was not started")
+            time.sleep(0.1)
+
+
 def install(extra: list[str]) -> str:
     path = target_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
+        _stop_windows_watchdog()
         args = " ".join(f'"{a}"' for a in _args(extra))
         path.write_text(
             "@echo off\r\n"
@@ -65,6 +101,8 @@ def install(extra: list[str]) -> str:
     path.write_text(
         "[Unit]\nDescription=Codex Quota Watchdog\n\n"
         "[Service]\n"
+        # Codex jobs must survive a watchdog reload.
+        "KillMode=process\n"
         f"Environment=PYTHONPATH={PKG_PARENT}\n"
         f"Environment=\"PATH={os.environ.get('PATH', '')}\"\n"
         f"ExecStart={cmd}\nRestart=on-failure\nRestartSec=30\n\n"
@@ -72,7 +110,8 @@ def install(extra: list[str]) -> str:
         encoding="utf-8",
     )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", path.name], check=True)
+    subprocess.run(["systemctl", "--user", "enable", path.name], check=True)
+    subprocess.run(["systemctl", "--user", "restart", path.name], check=True)
     return f"installed and started {path} (systemd --user)"
 
 

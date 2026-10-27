@@ -221,6 +221,42 @@ class RelayTests(WatchdogTestCase):
         self.assertEqual(dog.state.phase, NEEDS_USER)
         self.queue.assert_not_called()
 
+    def test_database_lock_retries_monitoring_waiting_and_final_read(self):
+        for stage in ("monitoring", "waiting", "final"):
+            with self.subTest(stage=stage):
+                self.store.path.unlink(missing_ok=True)
+                self.queue.reset_mock()
+                dog = self.dog()
+                self.set_quota(five_used=0)
+                if stage != "monitoring":
+                    dog.tick()
+                if stage == "final":
+                    self.clock.now = dog.state.resume_after + 1
+                    self.set_quota(five_used=0)
+                    dog.tick()
+                    self.clock.now += self.cfg.confirm_interval_seconds
+                original = self.latest.side_effect
+                calls = 0
+
+                def read(thread_id):
+                    nonlocal calls
+                    calls += 1
+                    # Waiting reads coordinator/worker, then final delivery reads them again.
+                    if stage != "final" or calls == 3:
+                        raise desktop.DesktopBusyError("database is locked")
+                    return original(thread_id)
+
+                with mock.patch.object(desktop, "latest_turn", side_effect=read):
+                    dog.tick()
+                self.assertEqual(dog.state.phase, MONITORING if stage == "monitoring" else WAITING_RESET)
+                self.assertEqual(dog.state.relay_attempted_recoveries, [])
+                self.assertEqual(dog._healthy_streak, 0)
+                self.queue.assert_not_called()
+                if stage == "monitoring":
+                    dog.tick()
+                self.ready(dog)
+                self.queue.assert_called_once()
+
     def test_ownership_changes_during_final_check_defer_delivery(self):
         dog = self.dog()
         self.set_quota(five_used=100)

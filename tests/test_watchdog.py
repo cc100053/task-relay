@@ -320,6 +320,28 @@ class DesktopWatchdogTests(WatchdogTestCase):
         self.dog().tick()
         self.queue.assert_called_once()
 
+    def test_desktop_database_lock_defers_monitoring_and_final_delivery(self):
+        dog = self.dog()
+        self.set_quota(five_used=0)
+        self.latest.side_effect = desktop.DesktopBusyError("database is locked")
+        dog.tick()
+        self.assertEqual(dog.state.phase, MONITORING)
+        self.latest.side_effect = None
+        dog.tick()
+        self.clock.now = dog.state.resume_after + 1
+        self.set_quota(five_used=0)
+        dog.tick()
+        self.latest.side_effect = desktop.DesktopBusyError("database is locked")
+        dog.tick()
+        self.assertEqual(dog.state.phase, WAITING_RESET)
+        self.assertIsNone(dog.state.desktop_attempted_turn_id)
+        self.queue.assert_not_called()
+        self.latest.side_effect = None
+        dog.tick()
+        self.queue.assert_not_called()
+        dog.tick()
+        self.queue.assert_called_once()
+
     def test_desktop_dry_run_never_queues_or_stops(self):
         d = self.dog(dry_run=True)
         self.set_quota(five_used=100)

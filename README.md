@@ -153,6 +153,7 @@ cqw autostart uninstall
 cqw stop                  # stop a running watchdog (never touches Codex)
 ```
 The autostarted watchdog runs `cqw watch --quiet` and respects `armed` in your config.
+On Windows and Linux, installing again restarts only the watchdog so it loads the current config.
 
 ## Commands
 
@@ -246,6 +247,7 @@ on low quota but never restarts anything until you run `cqw clear`.
   It currently reads the desktop's `state_5.sqlite` and `thread_history_1.sqlite` read-only;
   missing data or schema changes block recovery. Older chats without projected turn history
   are unsupported. Queue acknowledgement confirms enqueueing, not completion of the resumed work.
+  Temporary SQLite busy/locked reads retry on the next poll, with fresh quota confirmations before delivery.
   Stopping the whole app remains opt-in (`stop_desktop`); relaunching it needs `restart_mode = "command"`.
   Process detection is by name/path heuristics — always check `cqw doctor` before arming.
 * **Windows consoles ignore polite stops**, so after `terminate_timeout_seconds` the CLI is force-killed.

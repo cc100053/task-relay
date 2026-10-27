@@ -87,6 +87,30 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(desktop.DesktopError):
             desktop.latest_turn(TID)
 
+    def test_database_busy_is_retryable_but_schema_errors_are_not(self):
+        for code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_BUSY | (2 << 8)):
+            with self.subTest(code=code):
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = code
+                with mock.patch.object(desktop.sqlite3, "connect", side_effect=error):
+                    with self.assertRaises(desktop.DesktopBusyError):
+                        desktop.latest_turn(TID)
+        with mock.patch.object(desktop.sqlite3, "connect", side_effect=sqlite3.OperationalError("no such table")):
+            with self.assertRaises(desktop.DesktopError) as caught:
+                desktop.latest_turn(TID)
+        self.assertNotIsInstance(caught.exception, desktop.DesktopBusyError)
+
+    def test_real_database_lock_recovers_after_release(self):
+        connect = sqlite3.connect
+        with closing(connect(self.home / "state_5.sqlite")) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            with mock.patch.object(desktop.sqlite3, "connect", side_effect=lambda *args, **kw: connect(
+                    *args, timeout=0, **kw)):
+                with self.assertRaises(desktop.DesktopBusyError):
+                    desktop.latest_turn(TID)
+            writer.rollback()
+        self.assertEqual(desktop.latest_turn(TID).status, "empty")
+
     def test_queue_uses_exact_chat_without_exec_or_last(self):
         with mock.patch.object(desktop, "popen_hidden") as spawn:
             proc = spawn.return_value.__enter__.return_value

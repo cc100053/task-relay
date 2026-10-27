@@ -143,8 +143,7 @@ class Watchdog:
         try:
             turn = desktop.latest_turn(self.cfg.thread_id)
         except desktop.DesktopError as exc:
-            self._park(NEEDS_USER, str(exc))
-            return self.cfg.poll_seconds
+            return self._desktop_read_failed(exc)
         if not turn.quota_limited or turn.turn_id == self.state.desktop_attempted_turn_id:
             return self.cfg.poll_seconds
         self.state.phase = WAITING_RESET
@@ -178,8 +177,7 @@ class Watchdog:
             if not relay.can_wake(turn):
                 return self.cfg.poll_seconds
         except desktop.DesktopError as exc:
-            self._park(NEEDS_USER, str(exc))
-            return self.cfg.poll_seconds
+            return self._desktop_read_failed(exc)
         self.state.phase = WAITING_RESET
         self.state.thread_id = current.coordinator
         self.state.account_id = snap.account_id
@@ -238,8 +236,7 @@ class Watchdog:
                     self._back_to_monitoring()
                     return self.cfg.poll_seconds
             except desktop.DesktopError as exc:
-                self._park(NEEDS_USER, str(exc))
-                return self.cfg.poll_seconds
+                return self._desktop_read_failed(exc)
             if current.resume_at is not None:
                 self.state.resume_after = max(self.state.resume_after or current.resume_at, current.resume_at)
         if self.state.resume_after and now < self.state.resume_after:
@@ -310,10 +307,13 @@ class Watchdog:
             return self.cfg.poll_seconds
         try:
             turn = desktop.latest_turn(self.cfg.thread_id)
-            if turn.turn_id != self.state.desktop_turn_id or not turn.quota_limited:
-                log.info("desktop chat advanced or no longer has a quota failure; cancelling recovery")
-                self._back_to_monitoring()
-                return self.cfg.poll_seconds
+        except desktop.DesktopError as exc:
+            return self._desktop_read_failed(exc)
+        if turn.turn_id != self.state.desktop_turn_id or not turn.quota_limited:
+            log.info("desktop chat advanced or no longer has a quota failure; cancelling recovery")
+            self._back_to_monitoring()
+            return self.cfg.poll_seconds
+        try:
             # Persist before sending: a crash or ambiguous timeout must never duplicate delivery.
             self.state.desktop_attempted_turn_id = turn.turn_id
             self.state.restart_history.append(now)
@@ -352,6 +352,9 @@ class Watchdog:
             # Catch ownership changes; the queued prompt verifies ownership again on execution.
             if relay.read(self.cfg.relay_state_path) != current:
                 return self.cfg.poll_seconds
+        except desktop.DesktopError as exc:
+            return self._desktop_read_failed(exc)
+        try:
             self.state.thread_id = current.coordinator
             self.state.relay_attempted_recoveries.extend(pending)
             self.state.restart_history.append(now)
@@ -368,6 +371,14 @@ class Watchdog:
         return self.cfg.poll_seconds
 
     # ----------------------------------------------------------------- parked
+    def _desktop_read_failed(self, exc: desktop.DesktopError) -> float:
+        self._healthy_streak = 0
+        if isinstance(exc, desktop.DesktopBusyError):
+            log.warning("%s; delivery not attempted, retrying next poll", exc)
+        else:
+            self._park(NEEDS_USER, str(exc))
+        return self.cfg.poll_seconds
+
     def _park(self, phase: str, note: str) -> None:
         self.state.phase = phase
         self.state.note = note

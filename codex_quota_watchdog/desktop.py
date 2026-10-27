@@ -18,6 +18,10 @@ class DesktopError(RuntimeError):
     pass
 
 
+class DesktopBusyError(DesktopError):
+    """A temporary SQLite lock; retry the read without attempting delivery."""
+
+
 @dataclass(frozen=True)
 class DesktopTurn:
     thread_id: str
@@ -54,7 +58,11 @@ def latest_turn(thread_id: str) -> DesktopTurn:
             raise DesktopError("invalid desktop turn error")
         limited = turn[1] == "failed" and isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded"
         return DesktopTurn(thread_id, turn[0], turn[1], limited, row[0])
-    except (sqlite3.Error, OSError, ValueError) as exc:
+    except sqlite3.Error as exc:
+        if (getattr(exc, "sqlite_errorcode", 0) & 0xff) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            raise DesktopBusyError(f"desktop database busy: {exc}") from exc
+        raise DesktopError(f"cannot read desktop chat state: {exc}") from exc
+    except (OSError, ValueError) as exc:
         raise DesktopError(f"cannot read desktop chat state: {exc}") from exc
 
 
